@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.png
+*.csv
+*.txt
+*.mcap
+*.zstd
+
+RUNS/
+outputs_*/
+debug_*/
+Output_charts_diagnostic/
+Output_metrics_assessment/
+*/Output_charts_diagnostic/
+*/Output_metrics_assessment/
+
+nav2_paper_scripts_sem_RUNS_waypoints.tar.gz

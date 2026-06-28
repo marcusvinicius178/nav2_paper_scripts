@@ -19,11 +19,7 @@ Primary metrics (main paper tables):
 - p95_y_primary_m
 - rmse_psi_primary_rad
 
-Primary metrics are computed against the best valid planner path found in the bag:
-priority order:
-    1) /plan
-    2) /plan_smoothed
-    3) /transformed_global_plan
+Primary metrics are computed against the mean GT reference passed in --gt-csv.
 
 Success and validity rules
 --------------------------
@@ -48,9 +44,9 @@ Human-likeness (secondary layer, raw GPS)
 - Applies best simple variant correction (e.g., flip_y) and start alignment for shape comparison.
 - Computed only for runs valid_for_tracking == 1 (to match primary metrics validity).
 
-Legacy GT CSV in local XY
--------------------------
---gt-csv is accepted for backward compatibility, but ignored for metrics in this version.
+GT CSV in local XY
+------------------
+--gt-csv is the primary reference used for trajectory tracking metrics.
 """
 
 import argparse
@@ -75,6 +71,10 @@ except Exception:
 
 
 RUN_INDEX_RE = re.compile(r"(\d+)$")
+
+
+def get_heading_window_m_for_scenario(scenario_id: int) -> float:
+    return 150.0 if int(scenario_id) == 1 else 85.0
 
 
 @dataclass
@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planner-id", required=True)
     parser.add_argument("--controller-id", required=True)
 
-    parser.add_argument("--gt-csv", required=True, help="Legacy mean GT CSV in local XY (ignored for metrics)")
+    parser.add_argument("--gt-csv", required=True, help="Mean GT CSV in local XY used as primary reference for tracking metrics")
     parser.add_argument("--out-dir", default="", help="Output directory (default: <runs-dir>/Output_metrics_assessment)")
 
     parser.add_argument(
@@ -155,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--executed-topic", default="/odometry/global")
     parser.add_argument(
         "--plan-topics",
-        default="/plan,/plan_smoothed,/transformed_global_plan",
+        default="/plan,/plan_smoothed,/transformed_global_plan,/received_global_plan",
         help="Comma-separated priority order for valid plan path selection"
     )
     parser.add_argument("--cmd-topics", default="/cmd_vel_nav,/cmd_vel")
@@ -574,6 +574,114 @@ def read_bag_data(
     return out
 
 
+
+def load_gt_reference_csv(gt_csv: Path) -> Dict[str, Any]:
+    if not gt_csv.exists():
+        raise FileNotFoundError(f"GT CSV not found: {gt_csv}")
+
+    rows = []
+    with gt_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+
+    if not rows:
+        raise RuntimeError(f"GT CSV is empty: {gt_csv}")
+
+    required = ["x_m", "y_m", "t_ns"]
+    missing = [c for c in required if c not in rows[0]]
+    if missing:
+        raise RuntimeError(f"GT CSV missing required columns {missing}. Found: {list(rows[0].keys())}")
+
+    x = np.asarray([float(r["x_m"]) for r in rows], dtype=float)
+    y = np.asarray([float(r["y_m"]) for r in rows], dtype=float)
+    t_ns = np.asarray([int(float(r["t_ns"])) for r in rows], dtype=np.int64)
+
+    xy = np.column_stack((x, y))
+    xy, t_ns, _, _ = remove_consecutive_duplicates_xy(xy, t=t_ns)
+
+    if xy.shape[0] < 2:
+        raise RuntimeError(f"GT CSV has fewer than 2 unique XY points after cleanup: {gt_csv}")
+
+    headings = heading_from_path(xy)
+    return {
+        "xy": xy,
+        "t_ns": t_ns,
+        "heading": headings,
+        "path_length_m": path_length(xy),
+        "goal_xy": xy[-1].copy(),
+        "goal_yaw": float(headings[-1]) if headings.size else 0.0,
+        "points": int(xy.shape[0]),
+        "source_csv": str(gt_csv),
+        "source_name": gt_csv.name,
+    }
+
+
+
+def rotate_xy(xy: np.ndarray, theta_rad: float) -> np.ndarray:
+    c = math.cos(theta_rad)
+    s = math.sin(theta_rad)
+    R = np.asarray([[c, -s], [s, c]], dtype=float)
+    return xy @ R.T
+
+
+def estimate_path_heading_window(xy: np.ndarray, window_m: float = 10.0, from_end: bool = False) -> float:
+    if xy.shape[0] < 2:
+        return 0.0
+    s = cumulative_arc_length(xy)
+    total = float(s[-1]) if s.size else 0.0
+    if total <= 1e-9:
+        return float(math.atan2(xy[-1, 1] - xy[0, 1], xy[-1, 0] - xy[0, 0]))
+    w = max(1.0, min(float(window_m), 0.25 * total))
+    if from_end:
+        target_s = max(0.0, total - w)
+        i0 = int(np.searchsorted(s, target_s, side='left'))
+        i1 = xy.shape[0] - 1
+    else:
+        i0 = 0
+        i1 = int(np.searchsorted(s, w, side='left'))
+        i1 = min(max(i1, 1), xy.shape[0] - 1)
+    dx = float(xy[i1, 0] - xy[i0, 0])
+    dy = float(xy[i1, 1] - xy[i0, 1])
+    if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+        return float(math.atan2(xy[-1, 1] - xy[0, 1], xy[-1, 0] - xy[0, 0]))
+    return float(math.atan2(dy, dx))
+
+
+def align_reference_to_execution_start_heading(
+    ref_xy: np.ndarray,
+    exec_xy: np.ndarray,
+    heading_window_m: float = 10.0,
+) -> Dict[str, Any]:
+    if ref_xy.shape[0] < 2 or exec_xy.shape[0] < 2:
+        return {
+            'xy': ref_xy.copy(),
+            'heading': heading_from_path(ref_xy),
+            'goal_xy': ref_xy[-1].copy(),
+            'goal_yaw': float(heading_from_path(ref_xy)[-1]) if ref_xy.shape[0] >= 2 else 0.0,
+            'rotation_rad': 0.0,
+            'translation_xy': np.zeros((2,), dtype=float),
+            'mode': 'identity',
+        }
+
+    ref_h0 = estimate_path_heading_window(ref_xy, window_m=heading_window_m, from_end=False)
+    exec_h0 = estimate_path_heading_window(exec_xy, window_m=heading_window_m, from_end=False)
+    theta = float(wrap_angle_rad(np.asarray([exec_h0 - ref_h0], dtype=float))[0])
+
+    ref0 = ref_xy[0].copy()
+    exec0 = exec_xy[0].copy()
+    rotated = rotate_xy(ref_xy - ref0, theta) + exec0
+    headings = heading_from_path(rotated)
+    return {
+        'xy': rotated,
+        'heading': headings,
+        'goal_xy': rotated[-1].copy(),
+        'goal_yaw': float(headings[-1]) if headings.size else 0.0,
+        'rotation_rad': theta,
+        'translation_xy': exec0 - rotate_xy(ref0.reshape(1,2), theta).reshape(2,),
+        'mode': 'start_heading_aligned',
+    }
+
 def project_points_to_polyline(points_xy: np.ndarray, ref_xy: np.ndarray) -> Dict[str, np.ndarray]:
     n_pts = points_xy.shape[0]
     n_ref = ref_xy.shape[0]
@@ -722,13 +830,19 @@ def compute_speed_and_smoothness(
         rms_jx = None
 
     rms_dotdelta = None
-
     rms_cmd_w = None
+
     if cmd is not None:
         mask = cmd["t_s"] <= eval_end_time_s + 1e-9
+        cmd_t_eval = cmd["t_s"][mask]
         wz = cmd["wz"][mask]
+
         if wz.size:
             rms_cmd_w = rms(wz)
+
+            wz_smooth = moving_average_1d(wz, window=11)
+            dotdelta = derivative(cmd_t_eval, wz_smooth, min_dt_s=1e-2)
+            rms_dotdelta = rms(dotdelta)
 
     return {
         "rmse_v_mps": rmse_v,
@@ -839,6 +953,7 @@ def compute_humanlikeness_for_bag(
     gps_topic: str,
     human_ctx: Optional[Dict[str, Any]],
     cutoff_t_ns: int,
+    heading_window_m: float,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "has_human_gt_gps": 1 if human_ctx is not None else 0,
@@ -862,7 +977,7 @@ def compute_humanlikeness_for_bag(
     n_samples = int(human_ctx["n_samples"])
 
     out["human_gt_reference"] = "gt_mean_raw_gps"
-    out["human_gt_alignment_mode"] = "variant_start_aligned"
+    out["human_gt_alignment_mode"] = "variant_heading_start_aligned"
 
     raw = mod.read_bag_gps_latlon(bag_dir, gps_topic)
     if raw is None or "t_ns" not in raw:
@@ -884,16 +999,28 @@ def compute_humanlikeness_for_bag(
     raw_cut = {"t_ns": t_ns, "lat": lat, "lon": lon}
 
     projected = mod.project_trace_to_common_origin(raw_cut, waypoint_ref["lat0_deg"], waypoint_ref["lon0_deg"])
-    raw_xy = projected["xy"]
+    raw_xy = projected["xy"].copy()
+
+    # Mesma correção fixa usada no script de charts
+    raw_xy = np.column_stack((-raw_xy[:, 1], raw_xy[:, 0]))
+
     if raw_xy.shape[0] < 2:
         out["human_gt_note"] = "HUMAN_GPS_TOO_SHORT"
         return out
 
     best = mod.choose_best_candidate(raw_xy, waypoint_ref["xy"], gt_ref["gt_mean_xy"], n_samples)
-    aligned_xy = mod.align_trace_start_to_reference(best["xy"], gt_ref["gt_mean_xy"])
+
+    best_rot_xy, residual_theta_rad = mod.apply_residual_heading_alignment(
+        best["xy"],
+        gt_ref["gt_mean_xy"],
+        window_m=heading_window_m,
+    )
+
+    aligned_xy = mod.align_trace_start_to_reference(best_rot_xy, gt_ref["gt_mean_xy"])
     metrics = mod.compute_curve_metrics_vs_reference(aligned_xy, gt_ref["gt_mean_xy"], n_samples)
 
     out["human_gt_best_variant"] = str(best.get("variant", ""))
+    out["human_gt_note"] = f"HUMAN_GPS_VARIANT={out['human_gt_best_variant']}; RESIDUAL_THETA_DEG={math.degrees(residual_theta_rad):.3f}"
     out["human_gt_rmse_y_m"] = float(metrics["rmse_lateral_m"])
     out["human_gt_p95_y_m"] = float(metrics["p95_lateral_m"])
     out["human_gt_max_y_m"] = float(metrics["max_lateral_m"])
@@ -904,6 +1031,7 @@ def compute_humanlikeness_for_bag(
         out["human_gt_note"] = f"HUMAN_GPS_VARIANT={out['human_gt_best_variant']}"
 
     return out
+
 
 
 def to_row_dict(run: RunMetrics) -> Dict[str, Any]:
@@ -957,12 +1085,12 @@ def aggregate_one_combination(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 pass
         return outv
 
-    topic_counts: Dict[str, int] = {}
+    primary_ref_counts: Dict[str, int] = {}
     for r in rows:
-        topic = str(r.get("plan_topic_used", ""))
-        if topic:
-            topic_counts[topic] = topic_counts.get(topic, 0) + 1
-    primary_ref_summary = max(topic_counts.items(), key=lambda kv: kv[1])[0] if topic_counts else "plan_missing"
+        ref_name = str(r.get("primary_reference", "")).strip()
+        if ref_name:
+            primary_ref_counts[ref_name] = primary_ref_counts.get(ref_name, 0) + 1
+    primary_ref_summary = max(primary_ref_counts.items(), key=lambda kv: kv[1])[0] if primary_ref_counts else "reference_missing"
 
     human_variant_counts: Dict[str, int] = {}
     for r in rows:
@@ -1047,8 +1175,15 @@ def main() -> int:
         print(f"ERROR: runs dir does not exist: {runs_dir}", file=sys.stderr)
         return 2
 
-    if gt_csv is not None:
-        print(f"[INFO] Legacy --gt-csv received and ignored for metrics: {gt_csv}")
+    if gt_csv is None:
+        print("ERROR: --gt-csv is required.", file=sys.stderr)
+        return 3
+
+    try:
+        gt_ref = load_gt_reference_csv(gt_csv)
+    except Exception as e:
+        print(f"ERROR: could not load GT CSV reference: {e}", file=sys.stderr)
+        return 6
 
     try:
         human_ctx = prepare_human_gt_context(
@@ -1068,9 +1203,12 @@ def main() -> int:
     plan_topic_candidates = [x.strip() for x in args.plan_topics.split(",") if x.strip()]
     cmd_topic_candidates = [x.strip() for x in args.cmd_topics.split(",") if x.strip()]
     target_speed_mps = args.speed_kmh / 3.6
+    heading_window_m = get_heading_window_m_for_scenario(args.scenario_id)
 
     print(f"[INFO] Found {len(bag_dirs)} run bags in {runs_dir}")
     print(f"[INFO] Metrics output dir: {out_dir}")
+    print(f"[INFO] Primary GT CSV reference: {gt_ref['source_csv']}")
+    print(f"[INFO] Primary GT path length [m]: {gt_ref['path_length_m']:.3f}")
     if human_ctx is not None:
         print("[INFO] Human-likeness GT raw GPS enabled")
         print(f"[INFO] Human GT GPS glob: {human_ctx['gt_gps_csv_glob']}")
@@ -1083,6 +1221,7 @@ def main() -> int:
 
     print(f"[INFO] success_PR_threshold = {args.success_pr_threshold:.2f}")
     print(f"[INFO] tracking_PR_threshold = {args.tracking_pr_threshold:.2f}")
+    print(f"[INFO] Residual heading alignment window_m = {heading_window_m:.1f}")
 
     per_run_rows: List[Dict[str, Any]] = []
 
@@ -1112,7 +1251,7 @@ def main() -> int:
                 bag_name=bag_name,
                 bag_dir=str(bag_dir),
 
-                primary_reference="plan_missing",
+                primary_reference="gt_csv_unavailable",
                 plan_topic_used="",
                 executed_topic_used=args.executed_topic,
                 cmd_topic_used="",
@@ -1160,41 +1299,26 @@ def main() -> int:
 
         has_plan = int(plan_data is not None and plan_data["xy"].shape[0] >= 2)
 
-        if has_plan:
-            primary_ref_name = "plan"
-            primary_ref_xy = plan_data["xy"]
-            primary_goal_xy = plan_data["goal_xy"]
-            primary_goal_yaw = plan_data["goal_yaw"]
-
-            primary_metrics = compute_tracking_against_reference(
-                exec_t_s=exec_data["t_s"],
-                exec_xy=exec_data["xy"],
-                exec_yaw=exec_data["yaw"],
-                ref_xy=primary_ref_xy,
-                ref_goal_xy=primary_goal_xy,
-                ref_goal_yaw=primary_goal_yaw,
-                success_pr_threshold=args.success_pr_threshold,
-                tracking_pr_threshold=args.tracking_pr_threshold,
-            )
-            eval_end_idx = int(primary_metrics["eval_end_idx"])
-        else:
-            primary_ref_name = "plan_missing"
-            notes.append("PRIMARY_METRICS_SKIPPED_NO_VALID_PLAN")
-            eval_end_idx = int(exec_data["t_s"].size - 1)
-            primary_metrics = {
-                "progress_ratio": 0.0,
-                "success_geo": 0,
-                "valid_for_tracking": 0,
-                "eval_cutoff_reason": "plan_missing",
-                "mission_time_s": float(exec_data["t_s"][-1] - exec_data["t_s"][0]) if exec_data["t_s"].size else float("nan"),
-                "raw_run_duration_s": float(exec_data["t_s"][-1] - exec_data["t_s"][0]) if exec_data["t_s"].size else float("nan"),
-                "final_dist_to_goal_m": float("nan"),
-                "final_yaw_err_to_goal_rad": float("nan"),
-                "rmse_y_m": None,
-                "p95_y_m": None,
-                "rmse_psi_rad": None,
-                "eval_end_idx": eval_end_idx,
-            }
+        primary_ref_aligned = align_reference_to_execution_start_heading(
+            ref_xy=gt_ref['xy'],
+            exec_xy=exec_data['xy'],
+            heading_window_m=heading_window_m,
+        )
+        primary_ref_name = f"gt_csv_start_heading_aligned:{gt_ref['source_name']}"
+        primary_metrics = compute_tracking_against_reference(
+            exec_t_s=exec_data["t_s"],
+            exec_xy=exec_data["xy"],
+            exec_yaw=exec_data["yaw"],
+            ref_xy=primary_ref_aligned["xy"],
+            ref_goal_xy=primary_ref_aligned["goal_xy"],
+            ref_goal_yaw=primary_ref_aligned["goal_yaw"],
+            success_pr_threshold=args.success_pr_threshold,
+            tracking_pr_threshold=args.tracking_pr_threshold,
+        )
+        notes.append(
+            f"PRIMARY_GT_ALIGN_MODE={primary_ref_aligned['mode']}; PRIMARY_GT_ALIGN_THETA_DEG={math.degrees(primary_ref_aligned['rotation_rad']):.3f}"
+        )
+        eval_end_idx = int(primary_metrics["eval_end_idx"])
 
         smooth = compute_speed_and_smoothness(
             exec_t_s=exec_data["t_s"],
@@ -1226,10 +1350,13 @@ def main() -> int:
                     gps_topic=args.gps_topic,
                     human_ctx=human_ctx,
                     cutoff_t_ns=cutoff_t_ns,
+                    heading_window_m=heading_window_m,
                 )
             except Exception as e:
                 aux_human["human_gt_note"] = f"HUMAN_GPS_COMPARE_FAILED: {e}"
 
+        if not has_plan:
+            notes.append("NO_VALID_PLAN_TOPIC_FOUND")
         if aux_human.get("human_gt_note"):
             notes.append(str(aux_human["human_gt_note"]))
         notes.extend([str(x) for x in bag.get("notes", [])])
@@ -1322,6 +1449,7 @@ def main() -> int:
     print(f"RMSE_psi: {agg['RMSE_psi_primary_median_iqr']}")
     print(f"RMSE_v: {agg['RMSE_v_median_iqr']}")
     print(f"RMS_jx: {agg['RMS_jx_median_iqr']}")
+    print(f"RMS_dotdelta: {agg['RMS_dotdelta_median_iqr']}")
     print(f"Human-like RMSE_y: {agg['Exec_Human_RMSE_y_median_iqr']}")
     print(f"Human-like P95_y: {agg['Exec_Human_P95_y_median_iqr']}")
     print(f"Human-like Max_y: {agg['Exec_Human_MAX_y_median_iqr']}")

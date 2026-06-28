@@ -1,17 +1,33 @@
+# Python
 __pycache__/
 *.pyc
-*.png
-*.csv
-*.txt
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+
+# OS/editor temp files
+.DS_Store
+*~
+.~lock.*
+*.swp
+*.swo
+
+# Large/raw ROS data
+*.bag
+*.db3
 *.mcap
+*.mcap.zstd
 *.zstd
 
-RUNS/
-outputs_*/
-debug_*/
-Output_charts_diagnostic/
-Output_metrics_assessment/
-*/Output_charts_diagnostic/
-*/Output_metrics_assessment/
+# Do not redistribute papers/templates
+*.pdf
+*.docx
 
-nav2_paper_scripts_sem_RUNS_waypoints.tar.gz
+# Local raw/large folders
+RUNS/
+tarde/
+waypoints/
+gt_from_bag_outputs/

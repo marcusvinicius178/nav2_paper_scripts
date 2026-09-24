@@ -26,16 +26,16 @@ Usage examples
 --------------
 Scenario 1 only:
   source /opt/ros/jazzy/setup.bash
-  python3 /home/marcus/NAV2_Paper_Scripts/run_assessment_batch.py \
-    --runs-root /home/marcus/NAV2_Paper_Scripts/RUNS \
-    --scenario Scenario_1_Reta:1:/home/marcus/NAV2_Paper_Scripts/scenario1_waypoints_debug.yaml:'/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/1-Scenario_reta_arco_Ground_truth/*vel_*/gps_fix_latlon.csv'
+  python3 /path/to/NAV2_Paper_Scripts/run_assessment_batch.py \
+    --runs-root /path/to/NAV2_Paper_Scripts/RUNS \
+    --scenario Scenario_1_Reta:1:/path/to/NAV2_Paper_Scripts/scenario1_waypoints_debug.yaml:'/path/to/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/1-Scenario_reta_arco_Ground_truth/*vel_*/gps_fix_latlon.csv'
 
 All scenarios (example placeholders for waypoint files):
   python3 run_assessment_batch.py \
-    --runs-root /home/marcus/NAV2_Paper_Scripts/RUNS \
-    --scenario Scenario_1_Reta:1:/home/marcus/NAV2_Paper_Scripts/scenario1_waypoints_debug.yaml:'/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/1-Scenario_reta_arco_Ground_truth/*vel_*/gps_fix_latlon.csv' \
-    --scenario Scenario_2_Reta_Arco_20:2:/home/marcus/NAV2_Paper_Scripts/scenario2_waypoints_debug.yaml:'/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/2-Scenario_reta_arco_20_Ground_truth/*vel_*/gps_fix_latlon.csv' \
-    --scenario Scenario_3_Reta_Arco_40:3:/home/marcus/NAV2_Paper_Scripts/scenario3_waypoints_debug.yaml:'/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/3-Scenario_reta_arco_40_Ground_truth/*vel_*/gps_fix_latlon.csv'
+    --runs-root /path/to/NAV2_Paper_Scripts/RUNS \
+    --scenario Scenario_1_Reta:1:/path/to/NAV2_Paper_Scripts/scenario1_waypoints_debug.yaml:'/path/to/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/1-Scenario_reta_arco_Ground_truth/*vel_*/gps_fix_latlon.csv' \
+    --scenario Scenario_2_Reta_Arco_20:2:/path/to/NAV2_Paper_Scripts/scenario2_waypoints_debug.yaml:'/path/to/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/2-Scenario_reta_arco_20_Ground_truth/*vel_*/gps_fix_latlon.csv' \
+    --scenario Scenario_3_Reta_Arco_40:3:/path/to/NAV2_Paper_Scripts/scenario3_waypoints_debug.yaml:'/path/to/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/per_bag/3-Scenario_reta_arco_40_Ground_truth/*vel_*/gps_fix_latlon.csv'
 
 Notes
 -----
@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Scenario configuration as: <scenario_dir_name>:<scenario_id>:<waypoint_file>:'<gt_gps_csv_glob>'\n"
-            "Example: Scenario_1_Reta:1:/home/marcus/.../scenario1_waypoints_debug.yaml:'.../per_bag/1-Scenario.../*vel_*/gps_fix_latlon.csv'\n"
+            "Example: Scenario_1_Reta:1:/path/to/NAV2_Paper_Scripts/.../scenario1_waypoints_debug.yaml:'.../per_bag/1-Scenario.../*vel_*/gps_fix_latlon.csv'\n"
             "Repeat --scenario for multiple scenarios."
         ),
     )

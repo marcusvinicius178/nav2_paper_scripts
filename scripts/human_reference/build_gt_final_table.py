@@ -13,10 +13,10 @@ What it does
     3) Diagnostics CSV (full row + flags)
 
 Usage example:
-  python3 /home/marcus/NAV2_Paper_Scripts/build_gt_final_table.py \
-    --input-csv /home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/gt_pair_reproducibility_from_bag.csv \
-    --within-csv /home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/within_bag_topic_consistency.csv \
-    --out-dir /home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/final_tables
+  python3 /path/to/NAV2_Paper_Scripts/build_gt_final_table.py \
+    --input-csv /path/to/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/gt_pair_reproducibility_from_bag.csv \
+    --within-csv /path/to/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/within_bag_topic_consistency.csv \
+    --out-dir /path/to/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/final_tables
 """
 
 import argparse
@@ -397,17 +397,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build final GT reproducibility table for paper/report.")
     parser.add_argument(
         "--input-csv",
-        default="/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/gt_pair_reproducibility_from_bag.csv",
+        default=str(Path(__file__).resolve().parents[2] / "gt_from_bag_outputs_aligned" / "gt_pair_reproducibility_from_bag.csv"),
         help="Path to gt_pair_reproducibility_from_bag.csv"
     )
     parser.add_argument(
         "--within-csv",
-        default="/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/within_bag_topic_consistency.csv",
+        default=str(Path(__file__).resolve().parents[2] / "gt_from_bag_outputs_aligned" / "within_bag_topic_consistency.csv"),
         help="Optional path to within_bag_topic_consistency.csv"
     )
     parser.add_argument(
         "--out-dir",
-        default="/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs_aligned/final_tables",
+        default=str(Path(__file__).resolve().parents[2] / "gt_from_bag_outputs_aligned" / "final_tables"),
         help="Output directory for final tables"
     )
     args = parser.parse_args()

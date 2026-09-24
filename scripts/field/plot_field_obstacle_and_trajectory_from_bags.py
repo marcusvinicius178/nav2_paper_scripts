@@ -21,7 +21,9 @@ Why use /global_costmap/obstacle_layer?
 
 Main output:
     Blue line: executed global trajectory.
-    Red points: occupied cells from the global obstacle layer.
+    Red squares: occupied cell areas from the global obstacle layer.
+    Orange polygon (optional): the configured truck footprint at the
+    time-synchronized minimum-clearance pose.
 
 Important:
     The plot uses equal aspect ratio:
@@ -42,23 +44,38 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import PatchCollection
+from matplotlib.patches import Polygon as MatplotlibPolygon
 import numpy as np
+
+ROS_IMPORT_ERROR = None
 
 try:
     import rosbag2_py
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
 except Exception as exc:
-    print("\nERROR: ROS 2 Python libraries were not found.")
-    print("Use the system Python, not Conda, for ROS 2 bags.")
-    print("")
-    print("Run:")
-    print("  conda deactivate")
-    print("  source /opt/ros/jazzy/setup.bash")
-    print("  /usr/bin/python3 ~/NAV2_Paper_Scripts/plot_field_obstacle_and_trajectory_from_bags.py ...")
-    print("")
-    print(f"Original error: {exc}\n")
-    sys.exit(1)
+    rosbag2_py = None
+    deserialize_message = None
+    get_message = None
+    ROS_IMPORT_ERROR = exc
+
+try:
+    from recompute_field_metrics_from_bags import (
+        BagData as MetricsBagData,
+        DEFAULT_NAV2_FOOTPRINT,
+        compute_synchronized_clearance,
+        footprint_to_string,
+        load_footprint_from_nav2_params,
+        occupancy_cell_polygon,
+        parse_footprint_value,
+        transform_footprint_polygon,
+    )
+except Exception as exc:
+    raise RuntimeError(
+        "The corrected plotting script requires recompute_field_metrics_from_bags.py "
+        "in the same directory. Install both corrected files together."
+    ) from exc
 
 
 @dataclass
@@ -89,7 +106,11 @@ class BagResult:
     label: str
     path: str
     trajectory_xy: np.ndarray
-    obstacle_xy: np.ndarray
+    obstacle_cells: np.ndarray
+    clearance_footprint_xy: np.ndarray
+    d_min_m: float
+    odom_frame: str
+    obstacle_frame: str
 
 
 def stamp_to_sec(stamp_msg) -> float:
@@ -139,6 +160,13 @@ def infer_storage_id(path: str) -> str:
 
 
 def open_bag_reader(path: str):
+    if rosbag2_py is None:
+        raise RuntimeError(
+            "ROS 2 Python libraries were not found. Run with /usr/bin/python3 "
+            "after sourcing /opt/ros/iron/setup.bash (or the installed ROS distribution). "
+            f"Original error: {ROS_IMPORT_ERROR}"
+        )
+
     storage_id = infer_storage_id(path)
 
     storage_options = rosbag2_py.StorageOptions(
@@ -261,8 +289,9 @@ def normalize_xy(
     normalized[:, 1] -= start_y
 
     if rotate_to_start_heading:
-        c = math.cos(-start_yaw)
-        s = math.sin(-start_yaw)
+        rotation_angle = math.pi / 2.0 - start_yaw
+        c = math.cos(rotation_angle)
+        s = math.sin(rotation_angle)
         rotation = np.array([[c, -s], [s, c]], dtype=float)
         normalized = normalized @ rotation.T
 
@@ -379,7 +408,10 @@ def read_bag(
 
         if topic == odom_topic:
             try:
-                odom_samples.append(odom_msg_to_sample(msg))
+                sample = odom_msg_to_sample(msg)
+                if sample.stamp_sec <= 0.0:
+                    sample.stamp_sec = float(_timestamp) * 1e-9
+                odom_samples.append(sample)
             except Exception as exc:
                 print(f"  Warning: failed to parse odometry message: {exc}")
 
@@ -393,7 +425,10 @@ def read_bag(
                 continue
 
             try:
-                grid_samples.append(occupancy_grid_msg_to_sample(msg))
+                sample = occupancy_grid_msg_to_sample(msg)
+                if sample.stamp_sec <= 0.0:
+                    sample.stamp_sec = float(_timestamp) * 1e-9
+                grid_samples.append(sample)
             except Exception as exc:
                 print(f"  Warning: failed to parse occupancy grid message: {exc}")
 
@@ -422,12 +457,13 @@ def extract_obstacle_points_from_grids(
     max_points: int,
     latest_grid_only: bool,
 ) -> np.ndarray:
+    """Return rows [center_x, center_y, resolution, grid_yaw]."""
     if not grids:
-        return np.empty((0, 2), dtype=float)
+        return np.empty((0, 4), dtype=float)
 
     selected_grids = [grids[-1]] if latest_grid_only else grids
 
-    points_list = []
+    cells_list = []
 
     for grid in selected_grids:
         occupied_rows, occupied_cols = np.where(grid.data >= threshold)
@@ -444,24 +480,39 @@ def extract_obstacle_points_from_grids(
         x_global = grid.origin_x + c * x_local - s * y_local
         y_global = grid.origin_y + s * x_local + c * y_local
 
-        points = np.column_stack([x_global, y_global])
-        points_list.append(points)
+        cells = np.column_stack(
+            [
+                x_global,
+                y_global,
+                np.full_like(x_global, grid.resolution, dtype=float),
+                np.full_like(x_global, grid.origin_yaw, dtype=float),
+            ]
+        )
+        cells_list.append(cells)
 
-    if not points_list:
-        return np.empty((0, 2), dtype=float)
+    if not cells_list:
+        return np.empty((0, 4), dtype=float)
 
-    all_points = np.vstack(points_list)
+    all_cells = np.vstack(cells_list)
 
     # Remove duplicate occupied cells.
-    rounded = np.round(all_points, decimals=3)
+    rounded = np.round(all_cells, decimals=6)
     _, unique_idx = np.unique(rounded, axis=0, return_index=True)
-    all_points = all_points[np.sort(unique_idx)]
+    all_cells = all_cells[np.sort(unique_idx)]
 
-    if all_points.shape[0] > max_points:
-        idx = np.linspace(0, all_points.shape[0] - 1, max_points).astype(int)
-        all_points = all_points[idx]
+    if all_cells.shape[0] > max_points:
+        idx = np.linspace(0, all_cells.shape[0] - 1, max_points).astype(int)
+        all_cells = all_cells[idx]
 
-    return all_points
+    return all_cells
+
+
+def resolve_footprint(args) -> Tuple[np.ndarray, str]:
+    if args.footprint_polygon is not None:
+        return parse_footprint_value(args.footprint_polygon), "command_line"
+    if args.nav2_params is not None:
+        return load_footprint_from_nav2_params(args.nav2_params)
+    return DEFAULT_NAV2_FOOTPRINT.copy(), "verified_default:truck_nav2_params.yaml"
 
 
 def compute_bag_result(
@@ -470,6 +521,7 @@ def compute_bag_result(
     args,
     plot_roi: Optional[Tuple[float, float, float, float]],
     obstacle_roi: Optional[Tuple[float, float, float, float]],
+    footprint_local: np.ndarray,
 ) -> BagResult:
     odom_samples, grid_samples = read_bag(
         path=path,
@@ -485,12 +537,76 @@ def compute_bag_result(
 
     trajectory_xy = np.array([[sample.x, sample.y] for sample in odom_samples], dtype=float)
 
-    obstacle_xy = extract_obstacle_points_from_grids(
+    obstacle_cells = extract_obstacle_points_from_grids(
         grids=grid_samples,
         threshold=args.obstacle_threshold,
         max_points=args.max_obstacle_points,
         latest_grid_only=args.latest_grid_only,
     )
+
+    metric_arrays = {
+        "stamp": np.array([sample.stamp_sec for sample in odom_samples], dtype=float),
+        "x": np.array([sample.x for sample in odom_samples], dtype=float),
+        "y": np.array([sample.y for sample in odom_samples], dtype=float),
+        "yaw": np.array([sample.yaw for sample in odom_samples], dtype=float),
+    }
+    metric_bag = MetricsBagData(
+        label=label,
+        path=path,
+        odom_samples=odom_samples,
+        grid_samples=grid_samples,
+    )
+    clearance = compute_synchronized_clearance(
+        arrays=metric_arrays,
+        bag=metric_bag,
+        footprint_local=footprint_local,
+        args=args,
+        obstacle_roi=obstacle_roi,
+    )
+
+    # For footprint-clearance figures, show occupied cells from the exact
+    # obstacle grid synchronized with the minimum-clearance pose. Plotting
+    # cells accumulated from different timestamps could create an apparent
+    # footprint/obstacle intersection that was not present in the synchronized
+    # clearance calculation.
+    if (
+        args.plot_clearance_footprint
+        and math.isfinite(clearance.closest_grid_stamp_sec)
+        and grid_samples
+    ):
+        closest_grid_for_plot = min(
+            grid_samples,
+            key=lambda grid: abs(
+                float(grid.stamp_sec)
+                - float(clearance.closest_grid_stamp_sec)
+            ),
+        )
+
+        obstacle_cells = extract_obstacle_points_from_grids(
+            grids=[closest_grid_for_plot],
+            threshold=args.obstacle_threshold,
+            max_points=args.max_obstacle_points,
+            latest_grid_only=True,
+        )
+
+        print(
+            "  Obstacle visualization: synchronized minimum-clearance grid "
+            f"(stamp={closest_grid_for_plot.stamp_sec:.9f})"
+        )
+
+    if math.isfinite(clearance.closest_pose_x):
+        clearance_footprint_xy = transform_footprint_polygon(
+            footprint_local=footprint_local,
+            x=clearance.closest_pose_x,
+            y=clearance.closest_pose_y,
+            yaw=clearance.closest_pose_yaw,
+        )
+    else:
+        clearance_footprint_xy = np.empty((0, 2), dtype=float)
+
+    # The obstacle ROI is always interpreted in the original common global
+    # frame, matching the metric script.  Start normalization is visualization-only.
+    obstacle_cells = apply_roi(obstacle_cells, obstacle_roi)
 
     if args.normalize_start:
         start_x = odom_samples[0].x
@@ -505,15 +621,24 @@ def compute_bag_result(
             rotate_to_start_heading=args.rotate_to_start_heading,
         )
 
-        obstacle_xy = normalize_xy(
-            points_xy=obstacle_xy,
+        obstacle_cells[:, :2] = normalize_xy(
+            points_xy=obstacle_cells[:, :2],
             start_x=start_x,
             start_y=start_y,
             start_yaw=start_yaw,
             rotate_to_start_heading=args.rotate_to_start_heading,
         )
 
-    obstacle_xy = apply_roi(obstacle_xy, obstacle_roi)
+        if args.rotate_to_start_heading and obstacle_cells.size > 0:
+            obstacle_cells[:, 3] += math.pi / 2.0 - start_yaw
+
+        clearance_footprint_xy = normalize_xy(
+            points_xy=clearance_footprint_xy,
+            start_x=start_x,
+            start_y=start_y,
+            start_yaw=start_yaw,
+            rotate_to_start_heading=args.rotate_to_start_heading,
+        )
 
     if args.crop_trajectory_to_plot_roi:
         trajectory_xy = crop_trajectory_by_roi(trajectory_xy, plot_roi)
@@ -525,13 +650,14 @@ def compute_bag_result(
         )
 
     print(f"  Trajectory points plotted: {trajectory_xy.shape[0]}")
-    print(f"  Obstacle points plotted: {obstacle_xy.shape[0]}")
+    print(f"  Occupied cells plotted: {obstacle_cells.shape[0]}")
+    print(f"  Corrected d_min (footprint-to-cell area): {clearance.footprint_to_cell_area_m:.4f} m")
 
-    if obstacle_xy.shape[0] > 0:
+    if obstacle_cells.shape[0] > 0:
         print("  Obstacle bounds:")
-        print(f"    x: [{np.min(obstacle_xy[:, 0]):.2f}, {np.max(obstacle_xy[:, 0]):.2f}] m")
-        print(f"    y: [{np.min(obstacle_xy[:, 1]):.2f}, {np.max(obstacle_xy[:, 1]):.2f}] m")
-        print(f"    centroid: ({np.mean(obstacle_xy[:, 0]):.2f}, {np.mean(obstacle_xy[:, 1]):.2f}) m")
+        print(f"    x: [{np.min(obstacle_cells[:, 0]):.2f}, {np.max(obstacle_cells[:, 0]):.2f}] m")
+        print(f"    y: [{np.min(obstacle_cells[:, 1]):.2f}, {np.max(obstacle_cells[:, 1]):.2f}] m")
+        print(f"    centroid: ({np.mean(obstacle_cells[:, 0]):.2f}, {np.mean(obstacle_cells[:, 1]):.2f}) m")
     else:
         print("  WARNING: no obstacle points were extracted.")
         print("  Try lowering --obstacle-threshold or removing --obstacle-roi.")
@@ -540,7 +666,11 @@ def compute_bag_result(
         label=label,
         path=path,
         trajectory_xy=trajectory_xy,
-        obstacle_xy=obstacle_xy,
+        obstacle_cells=obstacle_cells,
+        clearance_footprint_xy=clearance_footprint_xy,
+        d_min_m=clearance.footprint_to_cell_area_m,
+        odom_frame=clearance.odom_frame,
+        obstacle_frame=clearance.obstacle_frame,
     )
 
 
@@ -573,20 +703,20 @@ def apply_fixed_obstacle_reference(
         print("Keeping each panel with its own obstacle points.")
         return
 
-    if reference_result.obstacle_xy.size == 0:
+    if reference_result.obstacle_cells.size == 0:
         print("")
         print(f"WARNING: selected fixed obstacle reference is empty: {fixed_obstacle_from}")
         print("Keeping each panel with its own obstacle points.")
         return
 
-    fixed_obstacle = reference_result.obstacle_xy.copy()
+    fixed_obstacle = reference_result.obstacle_cells.copy()
 
     print("")
     print(f"Using fixed obstacle reference from: {fixed_obstacle_from}")
     print(f"Fixed obstacle points: {fixed_obstacle.shape[0]}")
 
     for result in results:
-        result.obstacle_xy = fixed_obstacle.copy()
+        result.obstacle_cells = fixed_obstacle.copy()
 
 
 def set_axes_from_roi(
@@ -643,6 +773,54 @@ def set_auto_axes(
     ax.set_ylim(ymin, ymax)
 
 
+def add_occupied_cells(ax, obstacle_cells: np.ndarray, args) -> None:
+    if obstacle_cells.size == 0:
+        return
+
+    patches = []
+    for center_x, center_y, resolution, grid_yaw in obstacle_cells:
+        polygon = occupancy_cell_polygon(
+            center_x=float(center_x),
+            center_y=float(center_y),
+            resolution=float(resolution),
+            grid_yaw=float(grid_yaw),
+        )
+        patches.append(MatplotlibPolygon(polygon, closed=True))
+
+    collection = PatchCollection(
+        patches,
+        facecolor="red",
+        edgecolor="darkred",
+        linewidth=0.25,
+        alpha=args.obstacle_alpha,
+        label="_nolegend_",
+        zorder=2,
+    )
+    ax.add_collection(collection)
+    ax.scatter(
+        [],
+        [],
+        s=36,
+        marker="s",
+        facecolor="red",
+        edgecolor="darkred",
+        alpha=args.obstacle_alpha,
+        label=args.obstacle_label,
+    )
+
+    if args.show_cell_centers:
+        ax.scatter(
+            obstacle_cells[:, 0],
+            obstacle_cells[:, 1],
+            s=args.obstacle_marker_size,
+            marker=".",
+            color="black",
+            alpha=0.7,
+            label="Occupied-cell centers",
+            zorder=3,
+        )
+
+
 def plot_results(
     results: List[BagResult],
     args,
@@ -659,7 +837,8 @@ def plot_results(
 
     for idx, (ax, result) in enumerate(zip(axes, results)):
         trajectory_xy = result.trajectory_xy
-        obstacle_xy = result.obstacle_xy
+        obstacle_cells = result.obstacle_cells
+        obstacle_xy = obstacle_cells[:, :2]
 
         if trajectory_xy.size > 0:
             ax.plot(
@@ -667,18 +846,35 @@ def plot_results(
                 trajectory_xy[:, 1],
                 linewidth=args.trajectory_linewidth,
                 color="tab:blue",
-                label="Global trajectory",
+                label="Trajectory",
             )
 
-        if obstacle_xy.size > 0:
-            ax.scatter(
-                obstacle_xy[:, 0],
-                obstacle_xy[:, 1],
-                s=args.obstacle_marker_size,
-                marker="o",
-                color="red",
-                alpha=0.85,
-                label=args.obstacle_label,
+        add_occupied_cells(ax, obstacle_cells, args)
+
+        if args.plot_clearance_footprint and result.clearance_footprint_xy.size > 0:
+            footprint_patch = MatplotlibPolygon(
+                result.clearance_footprint_xy,
+                closed=True,
+                facecolor="tab:orange",
+                edgecolor="0.25",
+                linewidth=0.35,
+                alpha=0.25,
+                label="Footprint",
+                zorder=4,
+            )
+            ax.add_patch(footprint_patch)
+
+        if args.annotate_clearance and math.isfinite(result.d_min_m):
+            ax.text(
+                0.02,
+                0.97,
+                rf"$d_{{\min}}={result.d_min_m:.2f}\,\mathrm{{m}}$",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                bbox={"facecolor": "white", "edgecolor": "0.7", "alpha": 0.85},
+                zorder=10,
             )
 
         if args.plot_obstacle_centroid and obstacle_xy.size > 0:
@@ -694,16 +890,17 @@ def plot_results(
                 label="Obstacle centroid",
             )
 
-        ax.set_title(args.title)
-        ax.set_xlabel("X [m]")
-        ax.set_ylabel("Y [m]")
+        ax.set_title(args.title, fontsize=9)
+        ax.set_xlabel("X [m]", fontsize=8)
+        ax.set_ylabel("Y [m]", fontsize=8)
+        ax.tick_params(axis="both", labelsize=7)
         ax.grid(True, alpha=0.35)
 
         # Critical for geometric correctness:
         # 1 meter in X is shown with the same visual length as 1 meter in Y.
         ax.set_aspect("equal", adjustable="box")
 
-        ax.legend(loc="best", fontsize=8)
+        ax.legend(loc=args.legend_loc, fontsize=6, framealpha=0.85, handlelength=1.4, borderpad=0.3, labelspacing=0.25)
 
         if plot_roi is not None:
             set_axes_from_roi(ax, plot_roi)
@@ -716,16 +913,17 @@ def plot_results(
                 equal_axes=args.equal_axes,
             )
 
-        panel_letter = chr(ord("a") + idx)
-        ax.text(
-            0.5,
-            -0.18,
-            f"({panel_letter}) {result.label}",
-            transform=ax.transAxes,
-            ha="center",
-            va="top",
-            fontsize=11,
-        )
+        if n > 1:
+            panel_letter = chr(ord("a") + idx)
+            ax.text(
+                0.5,
+                -0.18,
+                f"({panel_letter}) {result.label}",
+                transform=ax.transAxes,
+                ha="center",
+                va="top",
+                fontsize=11,
+            )
 
     fig.tight_layout()
 
@@ -754,6 +952,21 @@ def main() -> None:
         action="append",
         required=True,
         help='Bag specification as "Label:/path/to/bag.mcap". Can be repeated.',
+    )
+
+    parser.add_argument(
+        "--nav2-params",
+        default=None,
+        help=(
+            "Navigation2 YAML used to load and audit the footprint. If omitted, "
+            "the verified 9.605 x 3.478 m footprint is used."
+        ),
+    )
+
+    parser.add_argument(
+        "--footprint-polygon",
+        default=None,
+        help="Explicit footprint polygon; takes precedence over --nav2-params.",
     )
 
     parser.add_argument(
@@ -828,6 +1041,27 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--max-obstacle-cells-per-grid",
+        type=int,
+        default=50000,
+        help="Safety limit used by corrected clearance calculation. Default: 50000.",
+    )
+
+    parser.add_argument(
+        "--clearance-max-time-delta-s",
+        type=float,
+        default=1.0,
+        help="Maximum grid/odometry synchronization difference. Default: 1.0 s.",
+    )
+
+    parser.add_argument(
+        "--frame-check",
+        choices=["strict", "warn"],
+        default="strict",
+        help="Reject odometry/obstacle frame mismatch by default.",
+    )
+
+    parser.add_argument(
         "--obstacle-marker-size",
         type=float,
         default=12.0,
@@ -835,9 +1069,41 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--obstacle-alpha",
+        type=float,
+        default=0.42,
+        help="Opacity of occupied cell polygons. Default: 0.42.",
+    )
+
+    parser.add_argument(
+        "--show-cell-centers",
+        action="store_true",
+        help="Also mark the centers of occupied cells.",
+    )
+
+    parser.add_argument(
+        "--plot-clearance-footprint",
+        action="store_true",
+        help="Draw the oriented truck footprint at the synchronized minimum-clearance pose.",
+    )
+
+    parser.add_argument(
+        "--annotate-clearance",
+        action="store_true",
+        help="Annotate each panel with the corrected footprint-to-cell-area d_min.",
+    )
+
+    parser.add_argument(
         "--obstacle-label",
         default="Obstacle layer",
         help="Legend label for the obstacle markers.",
+    )
+
+    parser.add_argument(
+        "--legend-loc",
+        choices=["upper right", "upper left", "lower right", "lower left", "best"],
+        default="upper right",
+        help="Legend position in each panel. Default: upper right.",
     )
 
     parser.add_argument(
@@ -871,7 +1137,7 @@ def main() -> None:
     parser.add_argument(
         "--rotate-to-start-heading",
         action="store_true",
-        help="When used with --normalize-start, rotate each run so the initial heading is aligned.",
+        help="When used with --normalize-start, rotate each run so the initial heading is aligned with the positive Y axis (north).",
     )
 
     parser.add_argument(
@@ -927,8 +1193,29 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.clearance_max_time_delta_s < 0.0:
+        parser.error("--clearance-max-time-delta-s must be non-negative")
+
+    if args.max_obstacle_cells_per_grid <= 0:
+        parser.error("--max-obstacle-cells-per-grid must be positive")
+
+    if not 0.0 <= args.obstacle_alpha <= 1.0:
+        parser.error("--obstacle-alpha must be between 0 and 1")
+
+    if args.fixed_obstacle_from and (args.plot_clearance_footprint or args.annotate_clearance):
+        parser.error(
+            "--fixed-obstacle-from changes the displayed obstacle geometry and cannot be "
+            "combined with --plot-clearance-footprint or --annotate-clearance"
+        )
+
     plot_roi = parse_roi(args.plot_roi)
     obstacle_roi = parse_roi(args.obstacle_roi)
+    footprint_local, footprint_source = resolve_footprint(args)
+
+    print("")
+    print("Figure geometry configuration:")
+    print(f"  Footprint source: {footprint_source}")
+    print(f"  Footprint vertices [base_footprint]: {footprint_to_string(footprint_local)}")
 
     bag_specs = [parse_bag_arg(value) for value in args.bag]
 
@@ -941,6 +1228,7 @@ def main() -> None:
             args=args,
             plot_roi=plot_roi,
             obstacle_roi=obstacle_roi,
+            footprint_local=footprint_local,
         )
         results.append(result)
 

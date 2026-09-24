@@ -538,12 +538,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Extract GT trajectories directly from rosbags and analyze reproducibility.")
     parser.add_argument(
         "--bags-root",
-        default="/home/marcus/NAV2_Paper_Scripts/waypoints",
+        default=str(Path(__file__).resolve().parents[2] / "waypoints"),
         help="Root containing scenario folders with ground-truth bag directories"
     )
     parser.add_argument(
         "--out-dir",
-        default="/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs",
+        default=str(Path(__file__).resolve().parents[2] / "gt_from_bag_outputs"),
         help="Output directory"
     )
     parser.add_argument("--n-samples", type=int, default=300, help="Resample points for comparisons/mean GT")

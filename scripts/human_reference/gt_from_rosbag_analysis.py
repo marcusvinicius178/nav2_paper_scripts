@@ -22,8 +22,8 @@ Important (updated)
 
 Usage (after sourcing ROS 2):
   python3 gt_from_rosbag_analysis.py \
-    --bags-root /home/marcus/NAV2_Paper_Scripts/waypoints \
-    --out-dir /home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs \
+    --bags-root /path/to/NAV2_Paper_Scripts/waypoints \
+    --out-dir /path/to/NAV2_Paper_Scripts/gt_from_bag_outputs \
     --primary-topic /odometry/global \
     --n-samples 300 \
     --export-per-bag-csv
@@ -441,8 +441,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract GT trajectories from rosbags and compute reproducibility."
     )
-    parser.add_argument("--bags-root", default="/home/marcus/NAV2_Paper_Scripts/waypoints")
-    parser.add_argument("--out-dir", default="/home/marcus/NAV2_Paper_Scripts/gt_from_bag_outputs")
+    parser.add_argument("--bags-root", default="/path/to/NAV2_Paper_Scripts/waypoints")
+    parser.add_argument("--out-dir", default="/path/to/NAV2_Paper_Scripts/gt_from_bag_outputs")
     parser.add_argument(
         "--primary-topic",
         default="/odometry/global",

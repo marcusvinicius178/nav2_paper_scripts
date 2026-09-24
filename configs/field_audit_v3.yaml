@@ -1,0 +1,71 @@
+schema_version: field_audit_v3.0
+
+# Paths are resolved relative to NAV2_Paper_Scripts. Override them with
+# repeated --bag key:label:/absolute/path arguments when the bags live elsewhere.
+bags:
+  - key: human_driver
+    label: Human driver
+    path: tarde/reta_manual/reta_manual_0.mcap
+  - key: navfn_mppi
+    label: NavFn-MPPI
+    path: tarde/NAVFN_desvio_obstaculo/giro_nova_escala_ultimo_dia_NAVFN_0.mcap
+  - key: smac_mppi
+    label: SMAC-MPPI
+    path: tarde/SMAC_MPPI_desvio_de_obstaculo_correto/desvio_de_obstaculo_correto_0.mcap
+
+topic_candidates:
+  odometry:
+    - /odometry/global
+    - /odom
+    - /odometry/filtered
+  obstacle_grid:
+    - /global_costmap/obstacle_layer
+    - /global_costmap/costmap_raw
+    - /global_costmap/costmap
+  published_footprint:
+    - /global_costmap/published_footprint
+    - /local_costmap/published_footprint
+  gps:
+    - /gps/fix
+    - /fix
+    - /navsat/fix
+  imu:
+    - /imu/data
+    - /imu/data_raw
+  tf:
+    - /tf
+  tf_static:
+    - /tf_static
+  vehicle_state:
+    - /vehicle/status/velocity_status
+    - /vehicle/status
+    - /vehicle_state
+    - /velocity_status
+  rtk_explicit:
+    - /gps/rtk_status
+    - /gnss/rtk_status
+    - /ublox/navpvt
+    - /novatel/oem7/bestpos
+    - /fixposition/odometry_enu
+
+audit:
+  gap_factor: 5.0
+
+synchronization:
+  # Historical 1.0 s value remains the maximum admissible limit. Every
+  # effective delta is nevertheless exported and summarized.
+  maximum_delta_s: 1.0
+  minimum_header_fraction: 0.95
+  tolerances_s: [0.05, 0.10, 0.25, 0.50, 1.00]
+
+clearance:
+  nominal_occupancy_threshold: 50
+  max_occupied_cells_per_grid: 250000
+  maximum_footprint_time_delta_s: 1.0
+  # Recorded /global_costmap/published_footprint is preferred. If it is absent,
+  # this YAML is audited and used as the explicit fallback.
+  nav2_params: review_context/configs/truck_nav2_params.yaml
+
+sensitivity:
+  covariance_sigma_levels: [1.0, 2.0]
+

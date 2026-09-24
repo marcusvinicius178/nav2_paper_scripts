@@ -11,22 +11,44 @@ processing all run rosbags inside a directory and generating:
 
 Methodology implemented in this version
 ---------------------------------------
-Primary metrics (main paper tables):
+Mission-completion metrics (main paper tables):
 - success_geo
 - progress_ratio (maximum path progress ratio reached during the run)
 - mission_time_s
+
+Plan-tracking metrics (main paper tables):
 - rmse_y_primary_m
 - p95_y_primary_m
 - rmse_psi_primary_rad
 
-Primary metrics are computed against the mean GT reference passed in --gt-csv.
+Mission progress, success and the evaluation cutoff are computed against the
+common benchmark route passed in --gt-csv. Lateral and heading tracking errors
+are computed against the recorded Navigation2 plan active at each odometry
+timestamp. Plan messages are synchronized with odometry using the MCAP storage
+timestamp because some recorded Path messages have a zero header stamp.
+
+Plan topic priority defaults to:
+    /plan -> /received_global_plan -> /transformed_global_plan
+
+If the selected plan and executed odometry use different frames, the evaluator
+uses the direct time-synchronized transform recorded in /tf or /tf_static. The
+executed pose is transformed into the plan frame before projection. Each pose
+is then projected onto the polyline segments of the latest plan message
+recorded at or before that pose. For the first and last segment, the tangent is
+extended when the orthogonal projection lies outside the finite polyline. This
+prevents the longitudinal gap introduced by Navigation2 plan pruning from being
+misreported as lateral tracking error. This supports both static global plans
+and progressively pruned /transformed_global_plan messages.
 
 Success and validity rules
 --------------------------
 - Geometric success:
     success_geo = 1 if max(PR(t)) >= 0.90
-- Run valid for continuous metrics:
-    valid_for_tracking = 1 if max(PR(t)) >= 0.70
+- Run valid for mission-based continuous metrics:
+    valid_for_mission = 1 if max(PR(t)) >= 0.70
+- Run valid for plan-tracking metrics:
+    valid_for_tracking = 1 if valid_for_mission = 1 and the fraction of
+    evaluation samples with a same-frame active plan is at least 0.80
 
 Mission time definition
 -----------------------
@@ -42,11 +64,24 @@ Human-likeness (secondary layer, raw GPS)
 - Based on raw /gps/fix from simulation bag compared to raw GT GPS mean.
 - Uses a common origin from waypoint-file.
 - Applies best simple variant correction (e.g., flip_y) and start alignment for shape comparison.
-- Computed only for runs valid_for_tracking == 1 (to match primary metrics validity).
+- Computed only for runs valid_for_mission == 1.
 
 GT CSV in local XY
 ------------------
---gt-csv is the primary reference used for trajectory tracking metrics.
+--gt-csv is the common benchmark route used only for mission progress, success
+and cutoff timing. It is not used for plan-tracking RMSE. Human-likeness remains
+a separate raw-GPS sensitivity/shape layer, using the common waypoint origin
+and its own raw-GPS alignment procedure.
+
+Smoothness and steering-command metrics
+----------------------------------------
+- Longitudinal jerk is the second time derivative of the measured longitudinal
+  speed. An 11-sample centered moving average is applied to speed before the
+  first derivative and to acceleration before the second derivative.
+- Steering angle is reconstructed from the Navigation2 command using the
+  Ackermann bicycle relation delta = atan(L_eq * omega_cmd / v_cmd). Samples
+  below the configured minimum absolute command speed are excluded to avoid
+  division near zero. Steering-rate RMS is computed from d(delta)/dt.
 """
 
 import argparse
@@ -54,6 +89,7 @@ import csv
 import math
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -66,7 +102,7 @@ try:
     from rosidl_runtime_py.utilities import get_message
 except Exception:
     print("ERROR: Could not import ROS 2 Python APIs.", file=sys.stderr)
-    print("Run: source /opt/ros/jazzy/setup.bash", file=sys.stderr)
+    print("Run: source /opt/ros/<distro>/setup.bash", file=sys.stderr)
     raise
 
 
@@ -88,15 +124,25 @@ class RunMetrics:
     bag_dir: str
 
     primary_reference: str
+    progress_reference: str
     plan_topic_used: str
+    plan_frame_id: str
+    executed_frame_id: str
+    frame_transform_used: str
     executed_topic_used: str
     cmd_topic_used: str
 
     has_plan: int
+    plan_message_count: int
+    plan_tracking_samples: int
+    plan_tracking_coverage: float
+    plan_endpoint_extension_samples: int
+    plan_endpoint_extension_fraction: float
     has_human_gt_gps: int
 
     success_geo: int
     progress_ratio: float
+    valid_for_mission: int
     valid_for_tracking: int
     eval_cutoff_reason: str
 
@@ -109,6 +155,8 @@ class RunMetrics:
     rmse_y_primary_m: Optional[float]
     p95_y_primary_m: Optional[float]
     rmse_psi_primary_rad: Optional[float]
+    rmse_y_finite_segment_diagnostic_m: Optional[float]
+    p95_y_finite_segment_diagnostic_m: Optional[float]
 
     rmse_v_mps: Optional[float]
     rms_jx_mps3: Optional[float]
@@ -136,7 +184,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planner-id", required=True)
     parser.add_argument("--controller-id", required=True)
 
-    parser.add_argument("--gt-csv", required=True, help="Mean GT CSV in local XY used as primary reference for tracking metrics")
+    parser.add_argument(
+        "--gt-csv",
+        required=True,
+        help="Common benchmark CSV in local XY used for mission progress, success and cutoff timing.",
+    )
     parser.add_argument("--out-dir", default="", help="Output directory (default: <runs-dir>/Output_metrics_assessment)")
 
     parser.add_argument(
@@ -155,15 +207,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--executed-topic", default="/odometry/global")
     parser.add_argument(
         "--plan-topics",
-        default="/plan,/plan_smoothed,/transformed_global_plan,/received_global_plan",
-        help="Comma-separated priority order for valid plan path selection"
+        default="/plan,/received_global_plan,/transformed_global_plan,/plan_smoothed",
+        help="Comma-separated priority order for time-synchronized Navigation2 plan tracking"
     )
     parser.add_argument("--cmd-topics", default="/cmd_vel_nav,/cmd_vel")
+
+    parser.add_argument(
+        "--wheelbase-m",
+        type=float,
+        default=6.804,
+        help="Equivalent Ackermann wheelbase used to reconstruct steering angle from cmd_vel (default: 6.804 m)",
+    )
+    parser.add_argument(
+        "--steering-min-speed-mps",
+        type=float,
+        default=0.50,
+        help="Minimum absolute commanded speed used for steering reconstruction (default: 0.50 m/s)",
+    )
 
     parser.add_argument("--success-pr-threshold", type=float, default=0.90,
                         help="Run is geometric success if max PR >= this threshold")
     parser.add_argument("--tracking-pr-threshold", type=float, default=0.70,
                         help="Run is valid for continuous metrics if max PR >= this threshold")
+    parser.add_argument(
+        "--min-plan-coverage",
+        type=float,
+        default=0.80,
+        help="Minimum fraction of evaluation odometry samples with an active same-frame plan (default: 0.80)",
+    )
 
     return parser.parse_args()
 
@@ -223,22 +294,31 @@ def remove_consecutive_duplicates_xy(
     return xy[k], t_out, y_out, s_out
 
 
-def median_iqr(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
+def median_iqr(
+    values: List[float],
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return median, Q1 and Q3 for finite values.
+
+    The historical function name is retained for compatibility with the rest
+    of the script, but the returned interval is explicit rather than an IQR
+    width. This prevents a value such as ``median [Q3-Q1]`` from being mistaken
+    for ``median [Q1, Q3]`` in manuscript tables.
+    """
     vals = [float(v) for v in values if v is not None and math.isfinite(float(v))]
     if not vals:
-        return None, None
+        return None, None, None
     arr = np.asarray(vals, dtype=float)
     med = float(np.median(arr))
     q1 = float(np.percentile(arr, 25))
     q3 = float(np.percentile(arr, 75))
-    return med, (q3 - q1)
+    return med, q1, q3
 
 
 def fmt_median_iqr(values: List[float], decimals: int = 2) -> str:
-    med, iqr = median_iqr(values)
+    med, q1, q3 = median_iqr(values)
     if med is None:
         return "--"
-    return f"{med:.{decimals}f} [{iqr:.{decimals}f}]"
+    return f"{med:.{decimals}f} [{q1:.{decimals}f}, {q3:.{decimals}f}]"
 
 
 def rms(arr: np.ndarray) -> Optional[float]:
@@ -266,15 +346,57 @@ def moving_average_1d(x: np.ndarray, window: int = 11) -> np.ndarray:
     return np.convolve(x_pad, kernel, mode="valid")
 
 
-def derivative(t_s: np.ndarray, x: np.ndarray, min_dt_s: float = 1e-3) -> np.ndarray:
+def moving_average_with_time(
+    t_s: np.ndarray,
+    x: np.ndarray,
+    window: int = 11,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return a centered moving average with unsupported edge samples removed."""
+    if t_s.size == 0 or x.size == 0 or t_s.size != x.size:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    if window <= 1:
+        return t_s.copy(), x.copy()
+
+    w = min(int(window), int(x.size))
+    if w % 2 == 0:
+        w -= 1
+    if w <= 1:
+        return t_s.copy(), x.copy()
+
+    kernel = np.ones((w,), dtype=float) / float(w)
+    x_smooth = np.convolve(x, kernel, mode="valid")
+    pad = w // 2
+    t_smooth = t_s[pad:t_s.size - pad]
+    return t_smooth, x_smooth
+
+
+def derivative_with_time(
+    t_s: np.ndarray,
+    x: np.ndarray,
+    min_dt_s: float = 1e-3,
+) -> Tuple[np.ndarray, np.ndarray]:
     if t_s.size < 2 or x.size < 2 or t_s.size != x.size:
-        return np.array([], dtype=float)
+        return np.array([], dtype=float), np.array([], dtype=float)
+
     dt = np.diff(t_s)
     dx = np.diff(x)
-    valid = dt > min_dt_s
+    valid = (
+        (dt > min_dt_s)
+        & np.isfinite(dt)
+        & np.isfinite(x[:-1])
+        & np.isfinite(x[1:])
+    )
     if not np.any(valid):
-        return np.array([], dtype=float)
-    return dx[valid] / dt[valid]
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    t_mid = 0.5 * (t_s[:-1] + t_s[1:])
+    return t_mid[valid], dx[valid] / dt[valid]
+
+
+def derivative(t_s: np.ndarray, x: np.ndarray, min_dt_s: float = 1e-3) -> np.ndarray:
+    """Return the finite-difference derivative, retaining the legacy API."""
+    _, dx_dt = derivative_with_time(t_s, x, min_dt_s=min_dt_s)
+    return dx_dt
 
 
 def resolve_bag_uri_for_mcap(bag_dir: Path) -> Path:
@@ -329,6 +451,144 @@ def extract_path_xy_from_msg(msg: Any) -> Optional[np.ndarray]:
     return xy
 
 
+def extract_frame_id(msg: Any) -> str:
+    try:
+        return str(msg.header.frame_id).strip()
+    except Exception:
+        return ""
+
+
+def extract_header_stamp_ns(msg: Any) -> int:
+    try:
+        stamp = msg.header.stamp
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+    except Exception:
+        return 0
+
+
+def extract_transform_2d(transform: Any, storage_t_ns: int, is_static: bool) -> Optional[Dict[str, Any]]:
+    try:
+        parent = str(transform.header.frame_id).strip()
+        child = str(transform.child_frame_id).strip()
+        if not parent or not child:
+            return None
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        yaw = yaw_from_quaternion(
+            float(rotation.x),
+            float(rotation.y),
+            float(rotation.z),
+            float(rotation.w),
+        )
+        return {
+            "parent": parent,
+            "child": child,
+            "t_ns": int(storage_t_ns),
+            "tx": float(translation.x),
+            "ty": float(translation.y),
+            "yaw": float(yaw),
+            "is_static": bool(is_static),
+        }
+    except Exception:
+        return None
+
+
+def invert_transform_2d(tx: float, ty: float, yaw: float) -> Tuple[float, float, float]:
+    """Invert p_parent = R(yaw) * p_child + translation."""
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    inv_tx = -(c * tx + s * ty)
+    inv_ty = -(-s * tx + c * ty)
+    return float(inv_tx), float(inv_ty), float(-yaw)
+
+
+def build_tf_history(raw_transforms: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for item in raw_transforms:
+        key = (str(item["parent"]), str(item["child"]))
+        grouped.setdefault(key, []).append(item)
+
+    history: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for key, items in grouped.items():
+        dynamic_items = [item for item in items if not bool(item["is_static"])]
+        selected = dynamic_items if dynamic_items else items
+        selected.sort(key=lambda item: int(item["t_ns"]))
+
+        history[key] = {
+            "t_ns": np.asarray([int(item["t_ns"]) for item in selected], dtype=np.int64),
+            "tx": np.asarray([float(item["tx"]) for item in selected], dtype=float),
+            "ty": np.asarray([float(item["ty"]) for item in selected], dtype=float),
+            "yaw": np.asarray([float(item["yaw"]) for item in selected], dtype=float),
+            "is_static": not bool(dynamic_items),
+            "count": len(selected),
+        }
+    return history
+
+
+def direct_frames_transformable(
+    source_frame: str,
+    target_frame: str,
+    tf_history: Dict[Tuple[str, str], Dict[str, Any]],
+) -> bool:
+    if source_frame == target_frame and source_frame:
+        return True
+    if not source_frame or not target_frame:
+        return False
+    return (
+        (target_frame, source_frame) in tf_history
+        or (source_frame, target_frame) in tf_history
+    )
+
+
+def lookup_direct_transform_2d(
+    source_frame: str,
+    target_frame: str,
+    query_t_ns: int,
+    tf_history: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Optional[Tuple[float, float, float, str]]:
+    """Return T_target_source at the latest MCAP time not after query_t_ns."""
+    if source_frame == target_frame and source_frame:
+        return 0.0, 0.0, 0.0, "identity"
+
+    direct_key = (target_frame, source_frame)
+    reverse_key = (source_frame, target_frame)
+
+    invert = False
+    if direct_key in tf_history:
+        data = tf_history[direct_key]
+        parent, child = direct_key
+    elif reverse_key in tf_history:
+        data = tf_history[reverse_key]
+        parent, child = reverse_key
+        invert = True
+    else:
+        return None
+
+    times = np.asarray(data["t_ns"], dtype=np.int64)
+    if times.size == 0:
+        return None
+
+    if bool(data.get("is_static", False)):
+        index = int(times.size - 1)
+    else:
+        index = int(np.searchsorted(times, int(query_t_ns), side="right") - 1)
+        if index < 0:
+            return None
+
+    tx = float(data["tx"][index])
+    ty = float(data["ty"][index])
+    yaw = float(data["yaw"][index])
+
+    if invert:
+        tx, ty, yaw = invert_transform_2d(tx, ty, yaw)
+        description = f"inverse({parent}->{child})"
+    else:
+        description = f"{parent}->{child}"
+
+    return tx, ty, yaw, description
+
+
 def extract_odom_sample(msg: Any) -> Optional[Tuple[float, float, float, Optional[float]]]:
     try:
         p = msg.pose.pose.position
@@ -373,7 +633,10 @@ def read_bag_data(
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "executed_topic_used": executed_topic,
+        "executed_frame_id": "",
         "plan_topic_used": "",
+        "plan_frame_id": "",
+        "frame_transform_used": "",
         "cmd_topic_used": "",
         "exec": None,
         "plan": None,
@@ -381,6 +644,7 @@ def read_bag_data(
         "topic_type_map": {},
         "notes": [],
         "all_valid_plans": {},
+        "tf_history": {},
     }
 
     reader = rosbag2_py.SequentialReader()
@@ -403,11 +667,12 @@ def read_bag_data(
 
     existing_plan_topics = [t for t in plan_topic_candidates if t in topic_type_map]
     existing_cmd_topics = [t for t in cmd_topic_candidates if t in topic_type_map]
+    existing_tf_topics = [t for t in ["/tf", "/tf_static"] if t in topic_type_map]
 
     if existing_cmd_topics:
         out["cmd_topic_used"] = existing_cmd_topics[0]
 
-    topics_needed = [executed_topic] + existing_plan_topics + existing_cmd_topics
+    topics_needed = [executed_topic] + existing_plan_topics + existing_cmd_topics + existing_tf_topics
 
     try:
         if hasattr(rosbag2_py, "StorageFilter"):
@@ -424,14 +689,17 @@ def read_bag_data(
     exec_y: List[float] = []
     exec_yaw: List[float] = []
     exec_v: List[float] = []
+    exec_frame_ids: List[str] = []
 
     cmd_t_ns: List[int] = []
     cmd_vx: List[float] = []
     cmd_wz: List[float] = []
 
-    best_plan_per_topic: Dict[str, Dict[str, Any]] = {}
-    for topic in existing_plan_topics:
-        best_plan_per_topic[topic] = {"xy": None, "n_pts": -1, "t_ns": -1}
+    raw_transforms: List[Dict[str, Any]] = []
+
+    plan_history_per_topic: Dict[str, List[Dict[str, Any]]] = {
+        topic: [] for topic in existing_plan_topics
+    }
 
     chosen_cmd_topic = existing_cmd_topics[0] if existing_cmd_topics else ""
 
@@ -456,18 +724,22 @@ def read_bag_data(
             exec_y.append(y)
             exec_yaw.append(yaw)
             exec_v.append(float(speed) if speed is not None and math.isfinite(speed) else float("nan"))
+            frame_id = extract_frame_id(msg)
+            if frame_id:
+                exec_frame_ids.append(frame_id)
 
-        elif topic in best_plan_per_topic:
+        elif topic in plan_history_per_topic:
             xy = extract_path_xy_from_msg(msg)
             if xy is None:
                 continue
-            n_pts = int(xy.shape[0])
-            if n_pts > best_plan_per_topic[topic]["n_pts"] or (
-                n_pts == best_plan_per_topic[topic]["n_pts"] and int(t_ns) > best_plan_per_topic[topic]["t_ns"]
-            ):
-                best_plan_per_topic[topic]["xy"] = xy
-                best_plan_per_topic[topic]["n_pts"] = n_pts
-                best_plan_per_topic[topic]["t_ns"] = int(t_ns)
+            plan_history_per_topic[topic].append(
+                {
+                    "t_ns": int(t_ns),
+                    "header_t_ns": extract_header_stamp_ns(msg),
+                    "frame_id": extract_frame_id(msg),
+                    "xy": xy,
+                }
+            )
 
         elif topic == chosen_cmd_topic:
             tw = extract_cmd_twist(msg)
@@ -477,6 +749,18 @@ def read_bag_data(
             cmd_t_ns.append(int(t_ns))
             cmd_vx.append(vx)
             cmd_wz.append(wz)
+
+        elif topic in existing_tf_topics:
+            if not hasattr(msg, "transforms"):
+                continue
+            for transform in msg.transforms:
+                item = extract_transform_2d(
+                    transform=transform,
+                    storage_t_ns=int(t_ns),
+                    is_static=(topic == "/tf_static"),
+                )
+                if item is not None:
+                    raw_transforms.append(item)
 
     if len(exec_t_ns) < 2:
         raise RuntimeError("Not enough executed odometry samples")
@@ -501,6 +785,11 @@ def read_bag_data(
         yaws=exec_yaw_arr,
         speeds=exec_v_arr
     )
+
+    executed_frame_id = Counter(exec_frame_ids).most_common(1)[0][0] if exec_frame_ids else ""
+    out["executed_frame_id"] = executed_frame_id
+    if not executed_frame_id:
+        out["notes"].append("EXECUTED_FRAME_ID_EMPTY")
 
     if np.any(~np.isfinite(exec_v_arr)):
         t_s = (exec_t_ns_arr - exec_t_ns_arr[0]).astype(float) / 1e9
@@ -527,22 +816,78 @@ def read_bag_data(
         "yaw": exec_yaw_arr,
         "v": exec_v_arr,
         "length_m": path_length(exec_xy),
+        "frame_id": executed_frame_id,
     }
 
+    tf_history = build_tf_history(raw_transforms)
+    out["tf_history"] = tf_history
+
     valid_plan_data: Dict[str, Dict[str, Any]] = {}
-    for topic, data in best_plan_per_topic.items():
-        xy = data["xy"]
-        if xy is None or xy.shape[0] < 2:
+    for topic, raw_events in plan_history_per_topic.items():
+        if not raw_events:
             continue
-        headings = heading_from_path(xy)
+
+        raw_events.sort(key=lambda event: int(event["t_ns"]))
+        nonempty_frames = [str(event["frame_id"]) for event in raw_events if str(event["frame_id"])]
+        topic_frame_id = Counter(nonempty_frames).most_common(1)[0][0] if nonempty_frames else ""
+
+        compatible_events: List[Dict[str, Any]] = []
+        incompatible_count = 0
+        for event in raw_events:
+            event_frame_id = str(event["frame_id"])
+            if not event_frame_id or event_frame_id != topic_frame_id:
+                incompatible_count += 1
+                continue
+            if not direct_frames_transformable(
+                source_frame=executed_frame_id,
+                target_frame=event_frame_id,
+                tf_history=tf_history,
+            ):
+                incompatible_count += 1
+                continue
+
+            xy = event["xy"]
+            if xy is None or xy.shape[0] < 2:
+                continue
+
+            headings = heading_from_path(xy)
+            compatible_events.append(
+                {
+                    "t_ns": int(event["t_ns"]),
+                    "header_t_ns": int(event["header_t_ns"]),
+                    "frame_id": event_frame_id,
+                    "xy": xy,
+                    "heading": headings,
+                    "s": cumulative_arc_length(xy),
+                    "length_m": path_length(xy),
+                    "points": int(xy.shape[0]),
+                }
+            )
+
+        if incompatible_count:
+            out["notes"].append(
+                f"PLAN_FRAME_UNTRANSFORMABLE_DROPPED topic={topic} count={incompatible_count} "
+                f"exec_frame={executed_frame_id or '<empty>'} plan_frame={topic_frame_id or '<empty>'}"
+            )
+
+        if not compatible_events:
+            continue
+
+        compatible_frames = [
+            str(event["frame_id"]) for event in compatible_events if str(event["frame_id"])
+        ]
+        compatible_frame_id = (
+            Counter(compatible_frames).most_common(1)[0][0]
+            if compatible_frames else ""
+        )
+        plan_t_ns = np.asarray([event["t_ns"] for event in compatible_events], dtype=np.int64)
+        zero_header_stamps = sum(int(event["header_t_ns"] == 0) for event in compatible_events)
         valid_plan_data[topic] = {
-            "xy": xy,
-            "heading": headings,
-            "s": cumulative_arc_length(xy),
-            "length_m": path_length(xy),
-            "goal_xy": xy[-1].copy(),
-            "goal_yaw": float(headings[-1]) if headings.size else 0.0,
-            "points": int(xy.shape[0]),
+            "messages": compatible_events,
+            "t_ns": plan_t_ns,
+            "frame_id": compatible_frame_id,
+            "message_count": len(compatible_events),
+            "zero_header_stamp_count": zero_header_stamps,
         }
 
     out["all_valid_plans"] = valid_plan_data
@@ -550,6 +895,20 @@ def read_bag_data(
     chosen_plan_topic, chosen_plan = choose_first_valid_plan(plan_topic_candidates, valid_plan_data)
     out["plan_topic_used"] = chosen_plan_topic
     out["plan"] = chosen_plan
+    if chosen_plan is not None:
+        out["plan_frame_id"] = str(chosen_plan.get("frame_id", ""))
+        if executed_frame_id == out["plan_frame_id"]:
+            out["frame_transform_used"] = "identity"
+        elif (out["plan_frame_id"], executed_frame_id) in tf_history:
+            out["frame_transform_used"] = f"{out['plan_frame_id']}->{executed_frame_id}"
+        elif (executed_frame_id, out["plan_frame_id"]) in tf_history:
+            out["frame_transform_used"] = f"inverse({executed_frame_id}->{out['plan_frame_id']})"
+        out["notes"].append(
+            f"PLAN_TIME_SOURCE=MCAP_STORAGE_TIMESTAMP; PLAN_TOPIC={chosen_plan_topic}; "
+            f"FRAME_TRANSFORM={out['frame_transform_used'] or 'unavailable'}; "
+            f"PLAN_MESSAGES={chosen_plan['message_count']}; "
+            f"PLAN_ZERO_HEADER_STAMPS={chosen_plan['zero_header_stamp_count']}"
+        )
 
     if len(cmd_t_ns) >= 2:
         cmd_t_ns_arr = np.asarray(cmd_t_ns, dtype=np.int64)
@@ -563,7 +922,7 @@ def read_bag_data(
 
         out["cmd"] = {
             "t_ns": cmd_t_ns_arr,
-            "t_s": (cmd_t_ns_arr - cmd_t_ns_arr[0]).astype(float) / 1e9,
+            "t_s": (cmd_t_ns_arr - exec_t_ns_arr[0]).astype(float) / 1e9,
             "vx": cmd_vx_arr,
             "wz": cmd_wz_arr,
         }
@@ -682,12 +1041,30 @@ def align_reference_to_execution_start_heading(
         'mode': 'start_heading_aligned',
     }
 
-def project_points_to_polyline(points_xy: np.ndarray, ref_xy: np.ndarray) -> Dict[str, np.ndarray]:
+def project_points_to_polyline(
+    points_xy: np.ndarray,
+    ref_xy: np.ndarray,
+    extend_endpoint_tangents: bool = False,
+) -> Dict[str, np.ndarray]:
+    """Project points onto a reference polyline.
+
+    The conventional finite-segment projection is used for mission progress.
+    For active-plan cross-track error, ``extend_endpoint_tangents=True`` lets a
+    point before the first segment or after the last segment project onto that
+    endpoint segment's supporting line. This removes the along-track gap caused
+    by Navigation2 plan pruning without extending interior segments.
+    """
     n_pts = points_xy.shape[0]
     n_ref = ref_xy.shape[0]
 
     if n_pts == 0 or n_ref < 2:
-        return {"dist": np.array([], dtype=float), "s_hat": np.array([], dtype=float), "heading_ref": np.array([], dtype=float)}
+        return {
+            "dist": np.array([], dtype=float),
+            "s_hat": np.array([], dtype=float),
+            "heading_ref": np.array([], dtype=float),
+            "endpoint_extrapolated": np.array([], dtype=bool),
+            "finite_segment_dist": np.array([], dtype=float),
+        }
 
     ref_seg = ref_xy[1:] - ref_xy[:-1]
     ref_seg_len2 = np.sum(ref_seg * ref_seg, axis=1)
@@ -698,17 +1075,19 @@ def project_points_to_polyline(points_xy: np.ndarray, ref_xy: np.ndarray) -> Dic
     dist_out = np.zeros((n_pts,), dtype=float)
     s_out = np.zeros((n_pts,), dtype=float)
     heading_out = np.zeros((n_pts,), dtype=float)
+    endpoint_extrapolated_out = np.zeros((n_pts,), dtype=bool)
+    finite_segment_dist_out = np.zeros((n_pts,), dtype=float)
 
     for i in range(n_pts):
         p = points_xy[i]
         best_dist2 = float("inf")
         best_s = 0.0
         best_heading = 0.0
+        best_endpoint_extrapolated = False
 
         for j in range(n_ref - 1):
             a = ref_xy[j]
-            b = ref_xy[j + 1]
-            ab = b - a
+            ab = ref_seg[j]
             ab_len2 = ref_seg_len2[j]
 
             if ab_len2 <= 1e-12:
@@ -724,12 +1103,48 @@ def project_points_to_polyline(points_xy: np.ndarray, ref_xy: np.ndarray) -> Dic
                 best_dist2 = d2
                 best_s = float(s_ref[j] + tau * ref_seg_len[j])
                 best_heading = float(ref_heading[j])
+                best_endpoint_extrapolated = False
+
+        finite_segment_dist_out[i] = math.sqrt(best_dist2)
+
+        if extend_endpoint_tangents:
+            endpoint_candidates = ((0, "before"), (n_ref - 2, "after"))
+            for segment_index, side in endpoint_candidates:
+                a = ref_xy[segment_index]
+                ab = ref_seg[segment_index]
+                ab_len2 = ref_seg_len2[segment_index]
+                if ab_len2 <= 1e-12:
+                    continue
+                tau_raw = float(np.dot(p - a, ab) / ab_len2)
+                is_valid_extension = (
+                    (side == "before" and tau_raw < 0.0)
+                    or (side == "after" and tau_raw > 1.0)
+                )
+                if not is_valid_extension:
+                    continue
+                q = a + tau_raw * ab
+                d2 = float(np.sum((p - q) ** 2))
+                if d2 < best_dist2:
+                    best_dist2 = d2
+                    best_s = float(
+                        s_ref[segment_index]
+                        + tau_raw * ref_seg_len[segment_index]
+                    )
+                    best_heading = float(ref_heading[segment_index])
+                    best_endpoint_extrapolated = True
 
         dist_out[i] = math.sqrt(best_dist2)
         s_out[i] = best_s
         heading_out[i] = best_heading
+        endpoint_extrapolated_out[i] = best_endpoint_extrapolated
 
-    return {"dist": dist_out, "s_hat": s_out, "heading_ref": heading_out}
+    return {
+        "dist": dist_out,
+        "s_hat": s_out,
+        "heading_ref": heading_out,
+        "endpoint_extrapolated": endpoint_extrapolated_out,
+        "finite_segment_dist": finite_segment_dist_out,
+    }
 
 
 def compute_tracking_against_reference(
@@ -809,13 +1224,196 @@ def compute_tracking_against_reference(
     }
 
 
+def compute_tracking_against_time_varying_plan(
+    exec_t_ns: np.ndarray,
+    exec_xy: np.ndarray,
+    exec_yaw: np.ndarray,
+    executed_frame_id: str,
+    plan_frame_id: str,
+    tf_history: Dict[Tuple[str, str], Dict[str, Any]],
+    plan_history: Optional[Dict[str, Any]],
+    eval_end_idx: int,
+    min_plan_coverage: float,
+) -> Dict[str, Any]:
+    """Compute executed-to-plan error using the latest plan available in MCAP time.
+
+    The Path header timestamp is deliberately ignored. For every executed pose,
+    the latest Path message whose MCAP storage timestamp is less than or equal
+    to the odometry storage timestamp is selected. Distance and reference
+    heading are obtained by orthogonal projection onto the plan polyline
+    segments. Endpoint tangents are extended only when a point lies before the
+    first segment or after the last segment, so a pruning gap is not counted as
+    lateral error.
+    """
+    n_eval = min(
+        max(int(eval_end_idx) + 1, 0),
+        int(exec_t_ns.size),
+        int(exec_xy.shape[0]),
+        int(exec_yaw.size),
+    )
+
+    empty = {
+        "rmse_y_m": None,
+        "p95_y_m": None,
+        "rmse_psi_rad": None,
+        "rmse_y_finite_segment_diagnostic_m": None,
+        "p95_y_finite_segment_diagnostic_m": None,
+        "tracking_samples": 0,
+        "tracking_coverage": 0.0,
+        "endpoint_extension_samples": 0,
+        "endpoint_extension_fraction": 0.0,
+        "plan_message_count": 0,
+        "plan_age_median_s": None,
+        "plan_age_max_s": None,
+        "frame_transform_samples": 0,
+        "frame_transform_coverage": 0.0,
+        "frame_transform_used": "unavailable",
+        "plan_tracking_available": 0,
+    }
+
+    if n_eval < 2 or plan_history is None:
+        return empty
+
+    messages = list(plan_history.get("messages", []))
+    plan_t_ns = np.asarray(plan_history.get("t_ns", []), dtype=np.int64)
+    if not messages or plan_t_ns.size == 0 or plan_t_ns.size != len(messages):
+        return empty
+
+    exec_t_eval = np.asarray(exec_t_ns[:n_eval], dtype=np.int64)
+    exec_xy_input = np.asarray(exec_xy[:n_eval], dtype=float)
+    exec_yaw_input = np.asarray(exec_yaw[:n_eval], dtype=float)
+
+    exec_xy_eval = np.full_like(exec_xy_input, np.nan, dtype=float)
+    exec_yaw_eval = np.full_like(exec_yaw_input, np.nan, dtype=float)
+    frame_transform_valid = np.zeros((n_eval,), dtype=bool)
+    frame_transform_descriptions: List[str] = []
+
+    for sample_index in range(n_eval):
+        transform = lookup_direct_transform_2d(
+            source_frame=executed_frame_id,
+            target_frame=plan_frame_id,
+            query_t_ns=int(exec_t_eval[sample_index]),
+            tf_history=tf_history,
+        )
+        if transform is None:
+            continue
+
+        tx, ty, theta, description = transform
+        c = math.cos(theta)
+        s = math.sin(theta)
+        x_source = float(exec_xy_input[sample_index, 0])
+        y_source = float(exec_xy_input[sample_index, 1])
+
+        exec_xy_eval[sample_index, 0] = tx + c * x_source - s * y_source
+        exec_xy_eval[sample_index, 1] = ty + s * x_source + c * y_source
+        exec_yaw_eval[sample_index] = float(
+            wrap_angle_rad(
+                np.asarray([exec_yaw_input[sample_index] + theta], dtype=float)
+            )[0]
+        )
+        frame_transform_valid[sample_index] = True
+        frame_transform_descriptions.append(description)
+
+    frame_transform_samples = int(np.count_nonzero(frame_transform_valid))
+    frame_transform_coverage = float(frame_transform_samples / n_eval) if n_eval else 0.0
+    frame_transform_used = (
+        Counter(frame_transform_descriptions).most_common(1)[0][0]
+        if frame_transform_descriptions else "unavailable"
+    )
+
+    active_plan_idx = np.searchsorted(plan_t_ns, exec_t_eval, side="right") - 1
+    has_active_plan = (active_plan_idx >= 0) & frame_transform_valid
+
+    dist = np.full((n_eval,), np.nan, dtype=float)
+    heading_ref = np.full((n_eval,), np.nan, dtype=float)
+    endpoint_extrapolated = np.zeros((n_eval,), dtype=bool)
+    finite_segment_dist = np.full((n_eval,), np.nan, dtype=float)
+
+    for plan_idx in np.unique(active_plan_idx[has_active_plan]):
+        plan_idx_int = int(plan_idx)
+        sample_idx = np.flatnonzero(
+            (active_plan_idx == plan_idx_int) & frame_transform_valid
+        )
+        if sample_idx.size == 0:
+            continue
+
+        ref_xy = np.asarray(messages[plan_idx_int]["xy"], dtype=float)
+        if ref_xy.shape[0] < 2:
+            continue
+
+        projected = project_points_to_polyline(
+            exec_xy_eval[sample_idx],
+            ref_xy,
+            extend_endpoint_tangents=True,
+        )
+        dist[sample_idx] = projected["dist"]
+        heading_ref[sample_idx] = projected["heading_ref"]
+        endpoint_extrapolated[sample_idx] = projected["endpoint_extrapolated"]
+        finite_segment_dist[sample_idx] = projected["finite_segment_dist"]
+
+    finite = np.isfinite(dist) & np.isfinite(heading_ref) & np.isfinite(exec_yaw_eval)
+    tracking_samples = int(np.count_nonzero(finite))
+    tracking_coverage = float(tracking_samples / n_eval) if n_eval > 0 else 0.0
+
+    if tracking_samples == 0:
+        result = dict(empty)
+        result["plan_message_count"] = len(messages)
+        result["frame_transform_samples"] = frame_transform_samples
+        result["frame_transform_coverage"] = frame_transform_coverage
+        result["frame_transform_used"] = frame_transform_used
+        return result
+
+    dist_valid = dist[finite]
+    finite_segment_dist_valid = finite_segment_dist[finite]
+    yaw_error = wrap_angle_rad(exec_yaw_eval[finite] - heading_ref[finite])
+    endpoint_extension_samples = int(
+        np.count_nonzero(endpoint_extrapolated[finite])
+    )
+    endpoint_extension_fraction = float(
+        endpoint_extension_samples / tracking_samples
+    )
+
+    matched_plan_idx = active_plan_idx[finite]
+    plan_age_s = (
+        exec_t_eval[finite] - plan_t_ns[matched_plan_idx]
+    ).astype(float) / 1e9
+    plan_age_s = plan_age_s[np.isfinite(plan_age_s) & (plan_age_s >= 0.0)]
+
+    return {
+        "rmse_y_m": float(np.sqrt(np.mean(dist_valid ** 2))),
+        "p95_y_m": float(np.percentile(dist_valid, 95)),
+        "rmse_psi_rad": float(np.sqrt(np.mean(yaw_error ** 2))),
+        "rmse_y_finite_segment_diagnostic_m": float(
+            np.sqrt(np.mean(finite_segment_dist_valid ** 2))
+        ),
+        "p95_y_finite_segment_diagnostic_m": float(
+            np.percentile(finite_segment_dist_valid, 95)
+        ),
+        "tracking_samples": tracking_samples,
+        "tracking_coverage": tracking_coverage,
+        "endpoint_extension_samples": endpoint_extension_samples,
+        "endpoint_extension_fraction": endpoint_extension_fraction,
+        "plan_message_count": len(messages),
+        "plan_age_median_s": float(np.median(plan_age_s)) if plan_age_s.size else None,
+        "plan_age_max_s": float(np.max(plan_age_s)) if plan_age_s.size else None,
+        "frame_transform_samples": frame_transform_samples,
+        "frame_transform_coverage": frame_transform_coverage,
+        "frame_transform_used": frame_transform_used,
+        "plan_tracking_available": int(
+            tracking_samples >= 2 and tracking_coverage >= float(min_plan_coverage)
+        ),
+    }
+
+
 def compute_speed_and_smoothness(
     exec_t_s: np.ndarray,
     exec_v: np.ndarray,
     eval_end_idx: int,
     target_speed_mps: float,
     cmd: Optional[Dict[str, Any]],
-    eval_end_time_s: float
+    eval_end_time_s: float,
+    wheelbase_m: float,
+    steering_min_speed_mps: float,
 ) -> Dict[str, Optional[float]]:
     v_eval = exec_v[:eval_end_idx + 1]
     t_eval = exec_t_s[:eval_end_idx + 1]
@@ -823,8 +1421,10 @@ def compute_speed_and_smoothness(
     rmse_v = float(np.sqrt(np.mean((v_eval - target_speed_mps) ** 2))) if v_eval.size else None
 
     if v_eval.size:
-        v_smooth = moving_average_1d(v_eval, window=11)
-        jx = derivative(t_eval, v_smooth, min_dt_s=1e-2)
+        t_v_smooth, v_smooth = moving_average_with_time(t_eval, v_eval, window=11)
+        t_accel, accel = derivative_with_time(t_v_smooth, v_smooth, min_dt_s=1e-2)
+        t_accel_smooth, accel_smooth = moving_average_with_time(t_accel, accel, window=11)
+        _, jx = derivative_with_time(t_accel_smooth, accel_smooth, min_dt_s=1e-2)
         rms_jx = rms(jx)
     else:
         rms_jx = None
@@ -835,13 +1435,29 @@ def compute_speed_and_smoothness(
     if cmd is not None:
         mask = cmd["t_s"] <= eval_end_time_s + 1e-9
         cmd_t_eval = cmd["t_s"][mask]
+        vx = cmd["vx"][mask]
         wz = cmd["wz"][mask]
 
         if wz.size:
             rms_cmd_w = rms(wz)
 
-            wz_smooth = moving_average_1d(wz, window=11)
-            dotdelta = derivative(cmd_t_eval, wz_smooth, min_dt_s=1e-2)
+        steering_mask = (
+            np.isfinite(cmd_t_eval)
+            & np.isfinite(vx)
+            & np.isfinite(wz)
+            & (np.abs(vx) >= steering_min_speed_mps)
+        )
+        if np.count_nonzero(steering_mask) >= 2:
+            steering_t = cmd_t_eval[steering_mask]
+            steering_delta = np.arctan(
+                wheelbase_m * wz[steering_mask] / vx[steering_mask]
+            )
+            steering_t_smooth, steering_delta_smooth = moving_average_with_time(
+                steering_t,
+                steering_delta,
+                window=11,
+            )
+            dotdelta = derivative(steering_t_smooth, steering_delta_smooth, min_dt_s=1e-2)
             rms_dotdelta = rms(dotdelta)
 
     return {
@@ -1053,7 +1669,8 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 def aggregate_one_combination(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     n_total = len(rows)
     n_success = sum(int(r["success_geo"]) for r in rows)
-    n_valid = sum(int(r["valid_for_tracking"]) for r in rows)
+    n_valid_mission = sum(int(r.get("valid_for_mission", 0)) for r in rows)
+    n_valid_tracking = sum(int(r["valid_for_tracking"]) for r in rows)
 
     def vals_all(key: str) -> List[float]:
         outv: List[float] = []
@@ -1069,10 +1686,26 @@ def aggregate_one_combination(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 pass
         return outv
 
-    def vals_valid(key: str) -> List[float]:
+    def vals_tracking_valid(key: str) -> List[float]:
         outv: List[float] = []
         for r in rows:
             if int(r["valid_for_tracking"]) != 1:
+                continue
+            v = r.get(key)
+            if v is None or v == "":
+                continue
+            try:
+                fv = float(v)
+                if math.isfinite(fv):
+                    outv.append(fv)
+            except Exception:
+                pass
+        return outv
+
+    def vals_mission_valid(key: str) -> List[float]:
+        outv: List[float] = []
+        for r in rows:
+            if int(r.get("valid_for_mission", 0)) != 1:
                 continue
             v = r.get(key)
             if v is None or v == "":
@@ -1094,14 +1727,14 @@ def aggregate_one_combination(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     human_variant_counts: Dict[str, int] = {}
     for r in rows:
-        if int(r.get("valid_for_tracking", 0)) != 1:
+        if int(r.get("valid_for_mission", 0)) != 1:
             continue
         variant = str(r.get("human_gt_best_variant", "")).strip()
         if variant:
             human_variant_counts[variant] = human_variant_counts.get(variant, 0) + 1
     dominant_human_variant = max(human_variant_counts.items(), key=lambda kv: kv[1])[0] if human_variant_counts else "not_enabled"
 
-    human_metric_runs = len(vals_valid("human_gt_rmse_y_m"))
+    human_metric_runs = len(vals_mission_valid("human_gt_rmse_y_m"))
 
     agg = {
         "scenario_id": rows[0]["scenario_id"],
@@ -1112,7 +1745,8 @@ def aggregate_one_combination(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         "N_total": n_total,
         "N_success_geo": n_success,
-        "N_valid_for_tracking": n_valid,
+        "N_valid_for_mission": n_valid_mission,
+        "N_valid_for_tracking": n_valid_tracking,
         "N_human_metric_runs": human_metric_runs,
         "SR_geo_text": f"{n_success}/{n_total}",
         "SR_geo_rate": (n_success / n_total) if n_total > 0 else None,
@@ -1122,20 +1756,26 @@ def aggregate_one_combination(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "human_best_variant_mode": dominant_human_variant,
 
         "PR_median_iqr": fmt_median_iqr(vals_all("progress_ratio")),
-        "T_median_iqr": fmt_median_iqr(vals_valid("mission_time_s")),
-        "RMSE_y_primary_median_iqr": fmt_median_iqr(vals_valid("rmse_y_primary_m")),
-        "P95_y_primary_median_iqr": fmt_median_iqr(vals_valid("p95_y_primary_m")),
-        "RMSE_psi_primary_median_iqr": fmt_median_iqr(vals_valid("rmse_psi_primary_rad")),
-        "RMSE_v_median_iqr": fmt_median_iqr(vals_valid("rmse_v_mps")),
-        "RMS_jx_median_iqr": fmt_median_iqr(vals_valid("rms_jx_mps3")),
-        "RMS_dotdelta_median_iqr": fmt_median_iqr(vals_valid("rms_dotdelta_radps")),
-        "RMS_cmd_w_median_iqr": fmt_median_iqr(vals_valid("rms_cmd_w_radps")),
+        "T_median_iqr": fmt_median_iqr(vals_mission_valid("mission_time_s")),
+        "RMSE_y_primary_median_iqr": fmt_median_iqr(vals_tracking_valid("rmse_y_primary_m")),
+        "P95_y_primary_median_iqr": fmt_median_iqr(vals_tracking_valid("p95_y_primary_m")),
+        "RMSE_psi_primary_median_iqr": fmt_median_iqr(vals_tracking_valid("rmse_psi_primary_rad")),
+        "RMSE_y_finite_segment_diagnostic_median_iqr": fmt_median_iqr(
+            vals_tracking_valid("rmse_y_finite_segment_diagnostic_m")
+        ),
+        "P95_y_finite_segment_diagnostic_median_iqr": fmt_median_iqr(
+            vals_tracking_valid("p95_y_finite_segment_diagnostic_m")
+        ),
+        "RMSE_v_median_iqr": fmt_median_iqr(vals_mission_valid("rmse_v_mps")),
+        "RMS_jx_median_iqr": fmt_median_iqr(vals_mission_valid("rms_jx_mps3")),
+        "RMS_dotdelta_median_iqr": fmt_median_iqr(vals_mission_valid("rms_dotdelta_radps")),
+        "RMS_cmd_w_median_iqr": fmt_median_iqr(vals_mission_valid("rms_cmd_w_radps")),
 
-        "Exec_Human_RMSE_y_median_iqr": fmt_median_iqr(vals_valid("human_gt_rmse_y_m")),
-        "Exec_Human_P95_y_median_iqr": fmt_median_iqr(vals_valid("human_gt_p95_y_m")),
-        "Exec_Human_MAX_y_median_iqr": fmt_median_iqr(vals_valid("human_gt_max_y_m")),
-        "Exec_Human_PR_median_iqr": fmt_median_iqr(vals_valid("human_gt_progress")),
-        "Exec_Human_Pointwise_RMSE_median_iqr": fmt_median_iqr(vals_valid("human_gt_pointwise_rmse_m")),
+        "Exec_Human_RMSE_y_median_iqr": fmt_median_iqr(vals_mission_valid("human_gt_rmse_y_m")),
+        "Exec_Human_P95_y_median_iqr": fmt_median_iqr(vals_mission_valid("human_gt_p95_y_m")),
+        "Exec_Human_MAX_y_median_iqr": fmt_median_iqr(vals_mission_valid("human_gt_max_y_m")),
+        "Exec_Human_PR_median_iqr": fmt_median_iqr(vals_mission_valid("human_gt_progress")),
+        "Exec_Human_Pointwise_RMSE_median_iqr": fmt_median_iqr(vals_mission_valid("human_gt_pointwise_rmse_m")),
     }
     return agg
 
@@ -1167,6 +1807,16 @@ def build_humanlikeness_table_row(agg: Dict[str, Any]) -> str:
 def main() -> int:
     args = parse_args()
 
+    if args.wheelbase_m <= 0.0:
+        print("ERROR: --wheelbase-m must be positive.", file=sys.stderr)
+        return 7
+    if args.steering_min_speed_mps < 0.0:
+        print("ERROR: --steering-min-speed-mps cannot be negative.", file=sys.stderr)
+        return 8
+    if not 0.0 <= args.min_plan_coverage <= 1.0:
+        print("ERROR: --min-plan-coverage must be in [0, 1].", file=sys.stderr)
+        return 9
+
     runs_dir = Path(args.runs_dir).expanduser().resolve()
     out_dir = (Path(args.out_dir).expanduser().resolve() if str(args.out_dir).strip() else (runs_dir / "Output_metrics_assessment").resolve())
     gt_csv = Path(args.gt_csv).expanduser().resolve() if args.gt_csv else None
@@ -1182,8 +1832,9 @@ def main() -> int:
     try:
         gt_ref = load_gt_reference_csv(gt_csv)
     except Exception as e:
-        print(f"ERROR: could not load GT CSV reference: {e}", file=sys.stderr)
+        print(f"ERROR: could not load common GT CSV reference: {e}", file=sys.stderr)
         return 6
+    progress_ref_name = f"gt_csv_start_heading_aligned:{gt_ref['source_name']}"
 
     try:
         human_ctx = prepare_human_gt_context(
@@ -1207,21 +1858,28 @@ def main() -> int:
 
     print(f"[INFO] Found {len(bag_dirs)} run bags in {runs_dir}")
     print(f"[INFO] Metrics output dir: {out_dir}")
-    print(f"[INFO] Primary GT CSV reference: {gt_ref['source_csv']}")
-    print(f"[INFO] Primary GT path length [m]: {gt_ref['path_length_m']:.3f}")
+    print(f"[INFO] Mission-progress common benchmark CSV: {gt_ref['source_csv']}")
+    print(f"[INFO] Mission-progress benchmark length [m]: {gt_ref['path_length_m']:.3f}")
+    print("[INFO] Primary lateral/heading reference: time-synchronized recorded Navigation2 plan")
+    print(f"[INFO] Nav2 plan topic priority: {','.join(plan_topic_candidates)}")
+    print("[INFO] Plan synchronization: latest plan at or before odometry MCAP storage timestamp")
+    print(f"[INFO] Minimum plan-tracking coverage = {args.min_plan_coverage:.2f}")
     if human_ctx is not None:
         print("[INFO] Human-likeness GT raw GPS enabled")
         print(f"[INFO] Human GT GPS glob: {human_ctx['gt_gps_csv_glob']}")
         print(f"[INFO] Human waypoint file: {human_ctx['waypoint_file']}")
         print(f"[INFO] Human common origin lat0_deg: {human_ctx['waypoint_ref']['lat0_deg']:.10f}")
         print(f"[INFO] Human common origin lon0_deg: {human_ctx['waypoint_ref']['lon0_deg']:.10f}")
-        print("[INFO] Human metrics will be computed only for valid_for_tracking runs")
+        print("[INFO] Human metrics will be computed only for valid_for_mission runs")
     else:
         print("[INFO] Human-likeness GT raw GPS: disabled")
 
     print(f"[INFO] success_PR_threshold = {args.success_pr_threshold:.2f}")
     print(f"[INFO] tracking_PR_threshold = {args.tracking_pr_threshold:.2f}")
     print(f"[INFO] Residual heading alignment window_m = {heading_window_m:.1f}")
+    print("[INFO] Longitudinal jerk: second derivative of 11-sample-smoothed speed")
+    print(f"[INFO] Ackermann steering reconstruction wheelbase_m = {args.wheelbase_m:.3f}")
+    print(f"[INFO] Steering reconstruction minimum speed_mps = {args.steering_min_speed_mps:.3f}")
 
     per_run_rows: List[Dict[str, Any]] = []
 
@@ -1251,16 +1909,26 @@ def main() -> int:
                 bag_name=bag_name,
                 bag_dir=str(bag_dir),
 
-                primary_reference="gt_csv_unavailable",
+                primary_reference="nav2_plan_unavailable",
+                progress_reference=progress_ref_name,
                 plan_topic_used="",
+                plan_frame_id="",
+                executed_frame_id="",
+                frame_transform_used="",
                 executed_topic_used=args.executed_topic,
                 cmd_topic_used="",
 
                 has_plan=0,
+                plan_message_count=0,
+                plan_tracking_samples=0,
+                plan_tracking_coverage=0.0,
+                plan_endpoint_extension_samples=0,
+                plan_endpoint_extension_fraction=0.0,
                 has_human_gt_gps=int(human_ctx is not None),
 
                 success_geo=0,
                 progress_ratio=0.0,
+                valid_for_mission=0,
                 valid_for_tracking=0,
                 eval_cutoff_reason="bag_read_failed",
 
@@ -1273,6 +1941,8 @@ def main() -> int:
                 rmse_y_primary_m=None,
                 p95_y_primary_m=None,
                 rmse_psi_primary_rad=None,
+                rmse_y_finite_segment_diagnostic_m=None,
+                p95_y_finite_segment_diagnostic_m=None,
 
                 rmse_v_mps=None,
                 rms_jx_mps3=None,
@@ -1297,28 +1967,69 @@ def main() -> int:
         plan_data = bag["plan"]
         cmd_data = bag["cmd"]
 
-        has_plan = int(plan_data is not None and plan_data["xy"].shape[0] >= 2)
+        has_plan = int(
+            plan_data is not None
+            and int(plan_data.get("message_count", 0)) > 0
+            and len(plan_data.get("messages", [])) > 0
+        )
 
-        primary_ref_aligned = align_reference_to_execution_start_heading(
-            ref_xy=gt_ref['xy'],
-            exec_xy=exec_data['xy'],
+        progress_ref_aligned = align_reference_to_execution_start_heading(
+            ref_xy=gt_ref["xy"],
+            exec_xy=exec_data["xy"],
             heading_window_m=heading_window_m,
         )
-        primary_ref_name = f"gt_csv_start_heading_aligned:{gt_ref['source_name']}"
-        primary_metrics = compute_tracking_against_reference(
+        mission_metrics = compute_tracking_against_reference(
             exec_t_s=exec_data["t_s"],
             exec_xy=exec_data["xy"],
             exec_yaw=exec_data["yaw"],
-            ref_xy=primary_ref_aligned["xy"],
-            ref_goal_xy=primary_ref_aligned["goal_xy"],
-            ref_goal_yaw=primary_ref_aligned["goal_yaw"],
+            ref_xy=progress_ref_aligned["xy"],
+            ref_goal_xy=progress_ref_aligned["goal_xy"],
+            ref_goal_yaw=progress_ref_aligned["goal_yaw"],
             success_pr_threshold=args.success_pr_threshold,
             tracking_pr_threshold=args.tracking_pr_threshold,
         )
         notes.append(
-            f"PRIMARY_GT_ALIGN_MODE={primary_ref_aligned['mode']}; PRIMARY_GT_ALIGN_THETA_DEG={math.degrees(primary_ref_aligned['rotation_rad']):.3f}"
+            f"PROGRESS_REF_ALIGN_MODE={progress_ref_aligned['mode']}; "
+            f"PROGRESS_REF_ALIGN_THETA_DEG={math.degrees(progress_ref_aligned['rotation_rad']):.3f}"
         )
-        eval_end_idx = int(primary_metrics["eval_end_idx"])
+        eval_end_idx = int(mission_metrics["eval_end_idx"])
+
+        plan_metrics = compute_tracking_against_time_varying_plan(
+            exec_t_ns=exec_data["t_ns"],
+            exec_xy=exec_data["xy"],
+            exec_yaw=exec_data["yaw"],
+            executed_frame_id=str(bag.get("executed_frame_id", "")),
+            plan_frame_id=str(bag.get("plan_frame_id", "")),
+            tf_history=bag.get("tf_history", {}),
+            plan_history=plan_data,
+            eval_end_idx=eval_end_idx,
+            min_plan_coverage=args.min_plan_coverage,
+        )
+        valid_for_mission = int(mission_metrics["valid_for_tracking"])
+        valid_for_tracking = int(
+            valid_for_mission == 1
+            and int(plan_metrics["plan_tracking_available"]) == 1
+        )
+
+        plan_age_median = plan_metrics.get("plan_age_median_s")
+        plan_age_max = plan_metrics.get("plan_age_max_s")
+        notes.append(
+            "PRIMARY_TRACKING_REF=TIME_SYNCHRONIZED_NAV2_PLAN; "
+            "PLAN_MATCH=LATEST_AT_OR_BEFORE_ODOM; "
+            "PLAN_CROSSTRACK_DEF=POLYLINE_SEGMENTS_WITH_ENDPOINT_TANGENT_EXTENSION; "
+            f"PLAN_TRACKING_SAMPLES={plan_metrics['tracking_samples']}; "
+            f"PLAN_TRACKING_COVERAGE={plan_metrics['tracking_coverage']:.6f}; "
+            f"PLAN_ENDPOINT_EXTENSION_SAMPLES={plan_metrics['endpoint_extension_samples']}; "
+            f"PLAN_ENDPOINT_EXTENSION_FRACTION={plan_metrics['endpoint_extension_fraction']:.6f}; "
+            f"FRAME_TRANSFORM={plan_metrics['frame_transform_used']}; "
+            f"FRAME_TRANSFORM_COVERAGE={plan_metrics['frame_transform_coverage']:.6f}; "
+            f"PLAN_AGE_MEDIAN_S={plan_age_median if plan_age_median is not None else 'NA'}; "
+            f"PLAN_AGE_MAX_S={plan_age_max if plan_age_max is not None else 'NA'}"
+        )
+        if valid_for_mission and not valid_for_tracking:
+            notes.append(
+                f"PLAN_TRACKING_INVALID_COVERAGE_LT_{args.min_plan_coverage:.2f}_OR_INSUFFICIENT_SAMPLES"
+            )
 
         smooth = compute_speed_and_smoothness(
             exec_t_s=exec_data["t_s"],
@@ -1327,6 +2038,13 @@ def main() -> int:
             target_speed_mps=target_speed_mps,
             cmd=cmd_data,
             eval_end_time_s=exec_data["t_s"][eval_end_idx],
+            wheelbase_m=args.wheelbase_m,
+            steering_min_speed_mps=args.steering_min_speed_mps,
+        )
+        notes.append(
+            "JERK_DEF=d2(smoothed_speed)/dt2; "
+            f"STEERING_RATE_DEF=d_atan(L*wz/vx)/dt; L_M={args.wheelbase_m:.3f}; "
+            f"MIN_ABS_VX_MPS={args.steering_min_speed_mps:.3f}"
         )
 
         aux_human = {
@@ -1339,10 +2057,10 @@ def main() -> int:
             "human_gt_max_y_m": None,
             "human_gt_progress": None,
             "human_gt_pointwise_rmse_m": None,
-            "human_gt_note": "HUMAN_GPS_SKIPPED_NOT_VALID_FOR_TRACKING",
+            "human_gt_note": "HUMAN_GPS_SKIPPED_NOT_VALID_FOR_MISSION",
         }
 
-        if human_ctx is not None and int(primary_metrics.get("valid_for_tracking", 0)) == 1:
+        if human_ctx is not None and valid_for_mission == 1:
             cutoff_t_ns = int(exec_data["t_ns"][eval_end_idx])
             try:
                 aux_human = compute_humanlikeness_for_bag(
@@ -1370,28 +2088,53 @@ def main() -> int:
             bag_name=bag_name,
             bag_dir=str(bag_dir),
 
-            primary_reference=primary_ref_name,
+            primary_reference=(
+                f"nav2_active_plan_cross_track_v2:{bag['plan_topic_used']}"
+                if has_plan else "nav2_plan_unavailable"
+            ),
+            progress_reference=progress_ref_name,
             plan_topic_used=bag["plan_topic_used"] if bag["plan_topic_used"] else "",
+            plan_frame_id=str(bag.get("plan_frame_id", "")),
+            executed_frame_id=str(bag.get("executed_frame_id", "")),
+            frame_transform_used=str(plan_metrics.get("frame_transform_used", "unavailable")),
             executed_topic_used=bag["executed_topic_used"],
             cmd_topic_used=bag["cmd_topic_used"] if bag["cmd_topic_used"] else "",
 
             has_plan=has_plan,
+            plan_message_count=int(plan_metrics["plan_message_count"]),
+            plan_tracking_samples=int(plan_metrics["tracking_samples"]),
+            plan_tracking_coverage=float(plan_metrics["tracking_coverage"]),
+            plan_endpoint_extension_samples=int(
+                plan_metrics["endpoint_extension_samples"]
+            ),
+            plan_endpoint_extension_fraction=float(
+                plan_metrics["endpoint_extension_fraction"]
+            ),
             has_human_gt_gps=int(aux_human.get("has_human_gt_gps", 0)),
 
-            success_geo=int(primary_metrics["success_geo"]),
-            progress_ratio=float(primary_metrics["progress_ratio"]),
-            valid_for_tracking=int(primary_metrics["valid_for_tracking"]),
-            eval_cutoff_reason=str(primary_metrics["eval_cutoff_reason"]),
+            success_geo=int(mission_metrics["success_geo"]),
+            progress_ratio=float(mission_metrics["progress_ratio"]),
+            valid_for_mission=valid_for_mission,
+            valid_for_tracking=valid_for_tracking,
+            eval_cutoff_reason=str(mission_metrics["eval_cutoff_reason"]),
 
-            mission_time_s=float(primary_metrics["mission_time_s"]),
-            raw_run_duration_s=float(primary_metrics["raw_run_duration_s"]),
+            mission_time_s=float(mission_metrics["mission_time_s"]),
+            raw_run_duration_s=float(mission_metrics["raw_run_duration_s"]),
 
-            final_dist_to_goal_m=float(primary_metrics["final_dist_to_goal_m"]),
-            final_yaw_err_to_goal_rad=float(primary_metrics["final_yaw_err_to_goal_rad"]),
+            final_dist_to_goal_m=float(mission_metrics["final_dist_to_goal_m"]),
+            final_yaw_err_to_goal_rad=float(mission_metrics["final_yaw_err_to_goal_rad"]),
 
-            rmse_y_primary_m=primary_metrics["rmse_y_m"],
-            p95_y_primary_m=primary_metrics["p95_y_m"],
-            rmse_psi_primary_rad=primary_metrics["rmse_psi_rad"],
+            rmse_y_primary_m=(plan_metrics["rmse_y_m"] if valid_for_tracking else None),
+            p95_y_primary_m=(plan_metrics["p95_y_m"] if valid_for_tracking else None),
+            rmse_psi_primary_rad=(plan_metrics["rmse_psi_rad"] if valid_for_tracking else None),
+            rmse_y_finite_segment_diagnostic_m=(
+                plan_metrics["rmse_y_finite_segment_diagnostic_m"]
+                if valid_for_tracking else None
+            ),
+            p95_y_finite_segment_diagnostic_m=(
+                plan_metrics["p95_y_finite_segment_diagnostic_m"]
+                if valid_for_tracking else None
+            ),
 
             rmse_v_mps=smooth["rmse_v_mps"],
             rms_jx_mps3=smooth["rms_jx_mps3"],
@@ -1441,11 +2184,21 @@ def main() -> int:
     print(f"Method: {agg['method_label']}")
     print(f"Runs: {agg['N_total']}")
     print(f"Success: {agg['SR_geo_text']}")
+    print(f"Mission-valid runs: {agg['N_valid_for_mission']}/{agg['N_total']}")
+    print(f"Plan-tracking-valid runs: {agg['N_valid_for_tracking']}/{agg['N_total']}")
     print(f"Primary reference: {agg['primary_tracking_reference']}")
     print(f"PR: {agg['PR_median_iqr']}")
     print(f"T: {agg['T_median_iqr']}")
     print(f"RMSE_y: {agg['RMSE_y_primary_median_iqr']}")
     print(f"P95_y: {agg['P95_y_primary_median_iqr']}")
+    print(
+        "Finite-segment diagnostic RMSE_y: "
+        f"{agg['RMSE_y_finite_segment_diagnostic_median_iqr']}"
+    )
+    print(
+        "Finite-segment diagnostic P95_y: "
+        f"{agg['P95_y_finite_segment_diagnostic_median_iqr']}"
+    )
     print(f"RMSE_psi: {agg['RMSE_psi_primary_median_iqr']}")
     print(f"RMSE_v: {agg['RMSE_v_median_iqr']}")
     print(f"RMS_jx: {agg['RMS_jx_median_iqr']}")
